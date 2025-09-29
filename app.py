@@ -7,7 +7,7 @@ Processes Headset inventory coverage and Distru inventory assets reports to calc
 Weeks on Hand (WOH) and generate production insights for private label flower products.
 
 Author: DC Retail
-Version: 1.5 - Hardcoded private label brands, simplified workflow
+Version: 1.6 - Added daily sales chart and renamed column labels
 """
 
 import streamlit as st
@@ -75,7 +75,7 @@ def initialize_session_state():
     
     # Set app version
     if st.session_state.app_version is None:
-        st.session_state.app_version = "1.5"
+        st.session_state.app_version = "1.6"
 
 initialize_session_state()
 
@@ -541,7 +541,7 @@ def create_woh_summary_chart(df: pd.DataFrame) -> go.Figure:
         
         summary.rename(columns={'Product Name': 'Product Count'}, inplace=True)
         
-        # Create heatmap
+        # Create bar chart
         fig = px.bar(
             summary, 
             x='Brand', 
@@ -563,6 +563,42 @@ def create_woh_summary_chart(df: pd.DataFrame) -> go.Figure:
         
     except Exception as e:
         st.error(f"Error creating WOH chart: {str(e)}")
+        return go.Figure()
+
+def create_daily_sales_chart(df: pd.DataFrame) -> go.Figure:
+    """Create daily sales performance chart by brand/weight combination"""
+    try:
+        # Group by Product Group (Brand + Weight)
+        sales_summary = df.groupby('Product Group').agg({
+            'In Stock Avg Units per Day': 'sum'
+        }).reset_index()
+        
+        # Sort by daily sales descending
+        sales_summary = sales_summary.sort_values('In Stock Avg Units per Day', ascending=False)
+        
+        # Create bar chart
+        fig = px.bar(
+            sales_summary,
+            x='Product Group',
+            y='In Stock Avg Units per Day',
+            title='Daily Sales Performance by Brand/Weight',
+            labels={'In Stock Avg Units per Day': 'Daily Sales (units)', 'Product Group': 'Product Type'},
+            height=500,
+            color='In Stock Avg Units per Day',
+            color_continuous_scale='Blues'
+        )
+        
+        fig.update_layout(
+            xaxis_tickangle=-45,
+            showlegend=False,
+            plot_bgcolor='rgba(0,0,0,0)',
+            paper_bgcolor='rgba(0,0,0,0)'
+        )
+        
+        return fig
+        
+    except Exception as e:
+        st.error(f"Error creating daily sales chart: {str(e)}")
         return go.Figure()
 
 def create_inventory_distribution_chart(df: pd.DataFrame) -> go.Figure:
@@ -618,7 +654,7 @@ def create_distru_stock_table(df: pd.DataFrame) -> pd.DataFrame:
         )
         
         summary.rename(columns={'Product Name': 'Products at Distro'}, inplace=True)
-        summary = summary[['Brand', 'Weight', 'Flower Category', 'Products at Distro', 'Distru Quantity', 'Distru Days Supply', 'Total Inventory', 'WOH']]
+        summary = summary[['Brand', 'Weight', 'Flower Category', 'Products at Distro', 'Distru Quantity', 'Distru Days Supply', 'Total Inventory', 'In Stock Avg Units per Day', 'WOH']]
         
         # Sort by Brand, Weight, then category order (Indica, Hybrid, Sativa)
         summary = summary.sort_values(['Brand', 'Weight'])
@@ -703,11 +739,14 @@ def create_expandable_product_summary(df: pd.DataFrame):
             
             # Sort by category order: Indica, Hybrid, Sativa
             category_summary = sort_by_category_order(category_summary, 'Flower Category')
-            category_summary = category_summary.round(1)
+            
+            # Rename for display
+            category_summary_display = category_summary.rename(columns={'In Stock Avg Units per Day': 'Daily Sales'})
+            category_summary_display = category_summary_display.round(1)
             
             # Display category summary
             st.markdown("**📊 By Category:**")
-            st.dataframe(category_summary, use_container_width=True, hide_index=True)
+            st.dataframe(category_summary_display, use_container_width=True, hide_index=True)
             
             # Individual products by category (only those with inventory)
             st.markdown("**🌿 Individual Products:**")
@@ -732,7 +771,11 @@ def create_expandable_product_summary(df: pd.DataFrame):
                         ]
                         
                         category_display = category_products[display_cols].copy()
-                        numeric_cols = ['Total Inventory', 'Distru Quantity', 'In Stock Avg Units per Day', 'WOH']
+                        
+                        # Rename for display
+                        category_display = category_display.rename(columns={'In Stock Avg Units per Day': 'Daily Sales'})
+                        
+                        numeric_cols = ['Total Inventory', 'Distru Quantity', 'Daily Sales', 'WOH']
                         for col in numeric_cols:
                             if col in category_display.columns:
                                 category_display[col] = category_display[col].round(1)
@@ -844,7 +887,12 @@ if st.session_state.combined_data is not None:
             avg_daily_sales = combined_df['In Stock Avg Units per Day'].sum()
             st.metric("Total Daily Sales", f"{avg_daily_sales:.1f}")
         
-        # Charts
+        # Daily Sales Performance Chart - Full Width
+        st.subheader("📈 Daily Sales Performance by Product Type")
+        daily_sales_chart = create_daily_sales_chart(combined_df)
+        st.plotly_chart(daily_sales_chart, use_container_width=True)
+        
+        # Charts Row
         col1, col2 = st.columns(2)
         
         with col1:
@@ -898,13 +946,22 @@ if st.session_state.combined_data is not None:
             # Sort options
             sort_by = st.selectbox(
                 "Sort by",
-                options=['WOH', 'Total Inventory', 'Distru Quantity', 'In Stock Avg Units per Day', 'Product Name'],
+                options=['WOH', 'Total Inventory', 'Distru Quantity', 'Daily Sales', 'Product Name'],
                 index=0
             )
             
             sort_ascending = st.checkbox("Sort ascending", value=False)
             
-            filtered_df_sorted = filtered_df.sort_values(sort_by, ascending=sort_ascending)
+            # Map display name back to column name for sorting
+            sort_column_map = {
+                'Daily Sales': 'In Stock Avg Units per Day',
+                'WOH': 'WOH',
+                'Total Inventory': 'Total Inventory',
+                'Distru Quantity': 'Distru Quantity',
+                'Product Name': 'Product Name'
+            }
+            
+            filtered_df_sorted = filtered_df.sort_values(sort_column_map[sort_by], ascending=sort_ascending)
             
             # Display filtered data
             st.subheader(f"📋 Product Details ({len(filtered_df_sorted)} products)")
@@ -918,8 +975,11 @@ if st.session_state.combined_data is not None:
             
             display_df = filtered_df_sorted[display_columns].copy()
             
+            # Rename for display
+            display_df = display_df.rename(columns={'In Stock Avg Units per Day': 'Daily Sales'})
+            
             # Round numeric columns
-            numeric_columns = ['Total Inventory', 'Distru Quantity', 'In Stock Avg Units per Day', 'WOH', 'Distru Days Supply']
+            numeric_columns = ['Total Inventory', 'Distru Quantity', 'Daily Sales', 'WOH', 'Distru Days Supply']
             for col in numeric_columns:
                 if col in display_df.columns:
                     display_df[col] = display_df[col].round(1)
@@ -942,7 +1002,11 @@ if st.session_state.combined_data is not None:
             
             if not distru_summary.empty:
                 st.subheader("📊 Distru Stock Summary")
-                st.dataframe(distru_summary, use_container_width=True)
+                
+                # Rename for display
+                distru_summary_display = distru_summary.rename(columns={'In Stock Avg Units per Day': 'Daily Sales'})
+                
+                st.dataframe(distru_summary_display, use_container_width=True)
             
             # Detailed product list
             st.subheader("📋 Detailed Product List")
@@ -962,13 +1026,16 @@ if st.session_state.combined_data is not None:
             # Display columns for Distru focus
             distru_display_columns = [
                 'Product Name', 'Brand', 'Flower Category', 'Weight',
-                'Distru Quantity', 'Distru Days Supply', 'Total Inventory', 'WOH'
+                'Distru Quantity', 'Distru Days Supply', 'Total Inventory', 'In Stock Avg Units per Day', 'WOH'
             ]
             
             distru_display_df = distru_stock_sorted[distru_display_columns].copy()
             
+            # Rename for display
+            distru_display_df = distru_display_df.rename(columns={'In Stock Avg Units per Day': 'Daily Sales'})
+            
             # Round numeric columns
-            numeric_columns = ['Distru Quantity', 'Distru Days Supply', 'Total Inventory', 'WOH']
+            numeric_columns = ['Distru Quantity', 'Distru Days Supply', 'Total Inventory', 'Daily Sales', 'WOH']
             for col in numeric_columns:
                 if col in distru_display_df.columns:
                     distru_display_df[col] = distru_display_df[col].round(1)
@@ -1047,6 +1114,11 @@ else:
             - 📦 Identifies products in stock at Distru
             - 📊 Interactive dashboards and filtering
             - 💾 CSV export functionality
+            
+            **v1.6 UI Improvements:**
+            - ✅ **Daily Sales Performance Chart** - New chart showing sales by brand/weight combination
+            - ✅ **Clearer Column Naming** - "In Stock Avg Units per Day" renamed to "Daily Sales"
+            - ✅ **Enhanced Product Summary** - Headers now show WOH and daily sales together
             
             **v1.5 Streamlined:**
             - ✅ **Hardcoded Brand List** - No more brand CSV upload needed
