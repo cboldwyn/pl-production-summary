@@ -7,7 +7,15 @@ Processes Headset inventory coverage and Distru inventory assets reports to calc
 Weeks on Hand (WOH) and generate production insights for private label flower products.
 
 Author: DC Retail
-Version: 1.6 - Added daily sales chart and renamed column labels
+Version: 1.8 - Production Ready
+Date: 2025
+
+Key Features:
+- Combines retail (Headset) and distribution (Distru) inventory data
+- Calculates Weeks on Hand (WOH) with outlier control
+- Tracks products in stock at distribution for production planning
+- Case-insensitive product matching across systems
+- Interactive dashboards with drill-down capabilities
 """
 
 import streamlit as st
@@ -19,13 +27,12 @@ from datetime import datetime
 from typing import Optional, Dict, List, Tuple
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 # =============================================================================
 # CONSTANTS
 # =============================================================================
 
-# Private Label Brands - hardcoded list
+# Private Label Brands - hardcoded list for consistency
 PRIVATE_LABEL_BRANDS = [
     'Black Label',
     'Black Label Platinum',
@@ -44,6 +51,16 @@ PRIVATE_LABEL_BRANDS = [
     'Side Hustle'
 ]
 
+# Flower category keywords for filtering
+FLOWER_KEYWORDS = ['indica', 'sativa', 'hybrid', 'flower']
+
+# Standard category order for consistent display
+CATEGORY_ORDER = ['Indica', 'Hybrid', 'Sativa', 'Unknown']
+
+# WOH calculation parameters
+MAX_WOH_WEEKS = 52.0  # Cap at 1 year for outlier control
+MIN_DAILY_SALES = 0.1  # Minimum threshold for reliable data
+
 # =============================================================================
 # PAGE CONFIGURATION
 # =============================================================================
@@ -54,7 +71,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# App header
 st.title("📊 Private Label Production Summary")
 st.markdown("**DC Retail** | Weekly inventory analysis and production planning for private label products")
 
@@ -63,19 +79,15 @@ st.markdown("**DC Retail** | Weekly inventory analysis and production planning f
 # =============================================================================
 
 def initialize_session_state():
-    """Initialize session state variables"""
-    session_vars = [
-        'headset_data', 'distru_data',
-        'combined_data', 'processed_data', 'app_version'
-    ]
+    """Initialize session state variables for data persistence"""
+    session_vars = ['headset_data', 'distru_data', 'combined_data', 'processed_data', 'app_version']
     
     for var in session_vars:
         if var not in st.session_state:
             st.session_state[var] = None
     
-    # Set app version
     if st.session_state.app_version is None:
-        st.session_state.app_version = "1.6"
+        st.session_state.app_version = "1.8"
 
 initialize_session_state()
 
@@ -84,7 +96,16 @@ initialize_session_state()
 # =============================================================================
 
 def safe_numeric(value, default=0):
-    """Convert any value to numeric, handling strings, NaN, None, etc."""
+    """
+    Convert any value to numeric, handling strings, NaN, None, etc.
+    
+    Args:
+        value: Value to convert
+        default: Default value if conversion fails
+        
+    Returns:
+        Numeric value (int or float) or default
+    """
     if pd.isna(value) or value is None or value == '':
         return default
     try:
@@ -99,21 +120,22 @@ def safe_numeric(value, default=0):
 
 def extract_weight_from_product_name(product_name: str) -> Tuple[str, str]:
     """
-    Extract weight from product name by removing the last string.
-    Returns: (product_name_without_weight, weight)
+    Extract weight from product name by removing the last token.
     
-    Examples:
-    - "Dope St. Exotics - Gmo Cookie 14g" → ("Dope St. Exotics - Gmo Cookie", "14g")
-    - "Lil' Buzzies - Strawberry Runtz Smalls 7g" → ("Lil' Buzzies - Strawberry Runtz Smalls", "7g")
+    Args:
+        product_name: Full product name (e.g., "Dope St. - Gmo Cookie 14g")
+        
+    Returns:
+        Tuple of (product_name_without_weight, weight)
+        Example: ("Dope St. - Gmo Cookie", "14g")
     """
     if pd.isna(product_name) or not isinstance(product_name, str):
         return str(product_name), ""
     
     parts = product_name.strip().split()
     if len(parts) >= 2:
-        # Check if last part looks like a weight (contains 'g')
         last_part = parts[-1]
-        if 'g' in last_part.lower():
+        if 'g' in last_part.lower():  # Check if last part looks like a weight
             return ' '.join(parts[:-1]), last_part
     
     return product_name, ""
@@ -122,10 +144,15 @@ def extract_brand_from_product_name(product_name: str) -> str:
     """
     Extract brand from product name (text before the first hyphen).
     
+    Args:
+        product_name: Full product name
+        
+    Returns:
+        Brand name
+        
     Examples:
-    - "Black Label - Cherry Warheads 3.5g" → "Black Label"
-    - "Block Party - Lemon Cherry Gelato 28g" → "Block Party"
-    - "Dope St. - Gelonade 14g" → "Dope St."
+        "Black Label - Cherry Warheads 3.5g" → "Black Label"
+        "Block Party - Lemon Cherry Gelato 28g" → "Block Party"
     """
     if pd.isna(product_name) or not isinstance(product_name, str):
         return ""
@@ -135,19 +162,26 @@ def extract_brand_from_product_name(product_name: str) -> str:
     elif '-' in product_name:
         return product_name.split('-')[0].strip()
     else:
-        # Fallback - try to extract first part
+        # Fallback - take first two words as brand
         parts = product_name.split()
         if len(parts) >= 2:
-            return ' '.join(parts[:2])  # Take first two words as brand
+            return ' '.join(parts[:2])
         return product_name
 
 def categorize_flower_type(category: str) -> str:
     """
-    Standardize flower category names, handling patterns like:
+    Standardize flower category names.
+    
+    Handles patterns like:
     - "Flower (Indica)" → "Indica"
-    - "Flower (Sativa)" → "Sativa" 
-    - "Flower (Hybrid)" → "Hybrid"
+    - "Flower (Sativa)" → "Sativa"
     - "Indica" → "Indica"
+    
+    Args:
+        category: Raw category string
+        
+    Returns:
+        Standardized category: Indica, Sativa, Hybrid, or Unknown
     """
     if pd.isna(category):
         return "Unknown"
@@ -155,72 +189,55 @@ def categorize_flower_type(category: str) -> str:
     category = str(category).lower().strip()
     
     # Handle "Flower (Type)" patterns
-    if 'flower' in category and '(' in category:
-        # Extract text within parentheses
-        if 'indica' in category:
-            return 'Indica'
-        elif 'sativa' in category:
-            return 'Sativa'
-        elif 'hybrid' in category:
-            return 'Hybrid'
-    
-    # Handle direct category names
     if 'indica' in category:
         return 'Indica'
     elif 'sativa' in category:
         return 'Sativa'
     elif 'hybrid' in category:
         return 'Hybrid'
-    
-    # If it's just "Flower" without subcategory, mark as Unknown for now
-    if category == 'flower':
+    elif category == 'flower':
         return 'Unknown'
     
     return category.title()
 
 def sort_by_category_order(df: pd.DataFrame, category_column: str = 'Flower Category') -> pd.DataFrame:
     """
-    Sort dataframe by standard category order: Indica, Hybrid, Sativa
+    Sort dataframe by standard category order: Indica, Hybrid, Sativa, Unknown.
     
     Args:
         df: DataFrame to sort
         category_column: Name of the category column
-    
+        
     Returns:
-        Sorted DataFrame
+        Sorted DataFrame with categorical ordering applied
     """
-    # Define category order
-    category_order = ['Indica', 'Hybrid', 'Sativa', 'Unknown']
-    
-    # Create categorical type with fixed order
     if category_column in df.columns:
         df[category_column] = pd.Categorical(
             df[category_column], 
-            categories=category_order, 
+            categories=CATEGORY_ORDER, 
             ordered=True
         )
         df = df.sort_values(category_column)
     
     return df
 
-def calculate_woh(total_inventory: float, daily_sales: float, max_woh: float = 52.0) -> float:
+def calculate_woh(total_inventory: float, daily_sales: float, max_woh: float = MAX_WOH_WEEKS) -> float:
     """
-    Calculate Weeks on Hand (WOH).
-    WOH = (Total Inventory / Daily Sales) / 7
-    Always round down for conservative estimate.
-    Cap at max_woh to handle outliers (default 52 weeks = 1 year).
+    Calculate Weeks on Hand (WOH) with outlier control.
+    
+    Formula: WOH = (Total Inventory / Daily Sales) / 7
+    - Caps at max_woh to prevent outliers from skewing aggregations
+    - Returns max_woh for products with insufficient sales data
+    - Always rounds down for conservative estimates
     
     Args:
         total_inventory: Total units in inventory
         daily_sales: Average daily sales rate
-        max_woh: Maximum weeks on hand to cap at (default 52)
+        max_woh: Maximum weeks on hand to cap at (default 52 weeks = 1 year)
     
     Returns:
-        Weeks on hand, capped at max_woh
+        Weeks on hand, capped at max_woh, rounded down to 1 decimal
     """
-    # Minimum daily sales threshold - products below this have insufficient data
-    MIN_DAILY_SALES = 0.1
-    
     if daily_sales < MIN_DAILY_SALES:
         # Insufficient data - return capped value
         return max_woh
@@ -228,21 +245,29 @@ def calculate_woh(total_inventory: float, daily_sales: float, max_woh: float = 5
     days_supply = total_inventory / daily_sales
     woh = days_supply / 7
     
-    # Cap at maximum to prevent outliers from skewing aggregations
+    # Cap at maximum to prevent outliers
     woh = min(woh, max_woh)
     
     return math.floor(woh * 10) / 10  # Round down to 1 decimal
 
 # =============================================================================
-# DATA LOADING AND PROCESSING
+# DATA LOADING FUNCTIONS
 # =============================================================================
 
 def load_headset_data(uploaded_file) -> Optional[pd.DataFrame]:
-    """Load and validate Headset inventory coverage report"""
+    """
+    Load and validate Headset inventory coverage report.
+    
+    Args:
+        uploaded_file: Uploaded CSV file
+        
+    Returns:
+        DataFrame with validated columns or None if loading fails
+    """
     try:
         df = pd.read_csv(uploaded_file, dtype=str)
         
-        # Check for required columns
+        # Validate required columns
         required_columns = [
             'Store Name', 'Product Name', 'Brand', 'Category', 
             'Total Quantity on Hand', 'In Stock Avg Units per Day'
@@ -254,10 +279,8 @@ def load_headset_data(uploaded_file) -> Optional[pd.DataFrame]:
             return None
         
         # Convert numeric columns
-        numeric_columns = ['Total Quantity on Hand', 'In Stock Avg Units per Day']
-        for col in numeric_columns:
-            if col in df.columns:
-                df[col] = df[col].apply(lambda x: safe_numeric(x, 0))
+        df['Total Quantity on Hand'] = df['Total Quantity on Hand'].apply(lambda x: safe_numeric(x, 0))
+        df['In Stock Avg Units per Day'] = df['In Stock Avg Units per Day'].apply(lambda x: safe_numeric(x, 0))
         
         return df
         
@@ -266,25 +289,24 @@ def load_headset_data(uploaded_file) -> Optional[pd.DataFrame]:
         return None
 
 def load_distru_data(uploaded_file) -> Optional[pd.DataFrame]:
-    """Load and validate Distru inventory assets report - skip metadata rows"""
+    """
+    Load and validate Distru inventory assets report.
+    
+    Note: Skips first 2 rows of metadata, uses row 3 as headers.
+    
+    Args:
+        uploaded_file: Uploaded CSV file
+        
+    Returns:
+        DataFrame with validated columns or None if loading fails
+    """
     try:
         # Skip first 2 rows of metadata, use row 3 as headers
         df = pd.read_csv(uploaded_file, skiprows=2, dtype=str)
         
-        # Check if we have data after skipping metadata
         if df.empty:
             st.error("❌ Distru file appears to be empty after skipping metadata rows")
             return None
-        
-        st.info(f"📋 Distru columns found: {list(df.columns)}")
-        
-        # Find Active Quantity column
-        if 'Active Quantity' not in df.columns:
-            st.warning(f"⚠️ 'Active Quantity' column not found.")
-            # Try to find similar columns
-            qty_columns = [col for col in df.columns if 'quantity' in col.lower()]
-            if qty_columns:
-                st.info(f"Found potential quantity columns: {qty_columns}")
         
         # Convert numeric columns
         numeric_columns = ['Active Quantity', 'Quantity', 'Total Quantity', 'Available Quantity']
@@ -296,7 +318,10 @@ def load_distru_data(uploaded_file) -> Optional[pd.DataFrame]:
         product_name_col = 'Product Name' if 'Product Name' in df.columns else 'Product'
         if 'Brand' not in df.columns and product_name_col in df.columns:
             df['Brand'] = df[product_name_col].apply(extract_brand_from_product_name)
-            st.info("✅ Extracted brands from Distru product names")
+        
+        # Standardize column name
+        if 'Product' in df.columns and 'Product Name' not in df.columns:
+            df['Product Name'] = df['Product']
         
         return df
         
@@ -304,55 +329,45 @@ def load_distru_data(uploaded_file) -> Optional[pd.DataFrame]:
         st.error(f"❌ Error loading Distru data: {str(e)}")
         return None
 
-def load_private_label_brands(uploaded_file) -> Optional[List[str]]:
-    """Load private label brands list"""
-    try:
-        df = pd.read_csv(uploaded_file)
-        
-        # Try to find brand column (could be 'Brand', 'brand', 'Brand Name', etc.)
-        brand_columns = [col for col in df.columns if 'brand' in col.lower()]
-        
-        if brand_columns:
-            brands = df[brand_columns[0]].dropna().unique().tolist()
-            return [str(brand).strip() for brand in brands if str(brand).strip()]
-        else:
-            # If no brand column found, use first column
-            brands = df.iloc[:, 0].dropna().unique().tolist()
-            return [str(brand).strip() for brand in brands if str(brand).strip()]
-            
-    except Exception as e:
-        st.error(f"❌ Error loading private label brands: {str(e)}")
-        return None
+# =============================================================================
+# DATA PROCESSING FUNCTIONS
+# =============================================================================
 
 def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) -> Optional[pd.DataFrame]:
     """
     Combine Headset and Distru data to calculate total inventory and WOH.
-    Focus on private label products and flower categories.
-    Fixed to properly count unique products and stores.
-    Uses hardcoded PRIVATE_LABEL_BRANDS list.
+    
+    Process:
+    1. Filter both datasets to private label brands and flower categories
+    2. Normalize product names for case-insensitive matching
+    3. Aggregate Headset data across all stores
+    4. Aggregate Distru data
+    5. Add Distru-only products (not in stores)
+    6. Merge datasets and calculate metrics
+    
+    Args:
+        headset_df: Headset inventory coverage report
+        distru_df: Distru inventory assets report
+        
+    Returns:
+        Combined DataFrame with calculated metrics or None if processing fails
     """
     try:
-        # Use hardcoded private label brands list
-        private_label_brands = PRIVATE_LABEL_BRANDS
+        # =====================================================================
+        # PROCESS HEADSET DATA
+        # =====================================================================
         
-        # Filter Headset data to private label brands only
-        headset_filtered = headset_df[headset_df['Brand'].isin(private_label_brands)].copy()
+        # Filter to private label brands
+        headset_filtered = headset_df[headset_df['Brand'].isin(PRIVATE_LABEL_BRANDS)].copy()
         
-        # Debug: Show filtering results
-        total_headset_products = len(headset_df)
-        filtered_headset_products = len(headset_filtered)
-        st.info(f"🎯 Headset filtering: {filtered_headset_products:,} of {total_headset_products:,} products are private label")
-        
-        if filtered_headset_products == 0:
-            unique_brands_in_headset = headset_df['Brand'].dropna().unique()
-            st.warning(f"⚠️ No private label brands found in Headset data. Available brands: {list(unique_brands_in_headset)[:10]}...")
+        if headset_filtered.empty:
+            st.warning("⚠️ No private label products found in Headset data")
             return None
         
-        # Filter to flower categories only (exclude pre-rolls, vapes, etc.)
-        flower_keywords = ['indica', 'sativa', 'hybrid', 'flower']
+        # Filter to flower categories
         headset_filtered = headset_filtered[
             headset_filtered['Category'].str.lower().str.contains(
-                '|'.join(flower_keywords), na=False
+                '|'.join(FLOWER_KEYWORDS), na=False
             )
         ].copy()
         
@@ -360,86 +375,79 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
             st.warning("⚠️ No private label flower products found in Headset data")
             return None
         
-        # Extract product weights
+        # Extract product weights and standardize categories
         headset_filtered[['Product Base Name', 'Weight']] = headset_filtered['Product Name'].apply(
             lambda x: pd.Series(extract_weight_from_product_name(x))
         )
-        
-        # Standardize categories
         headset_filtered['Flower Category'] = headset_filtered['Category'].apply(categorize_flower_type)
         
-        # Create a helper function to count stores with inventory
-        def count_stores_with_inventory(group):
-            # Count unique stores where Total Quantity on Hand > 0
-            stores_with_inventory = group[group['Total Quantity on Hand'] > 0]['Store Name'].nunique()
-            return stores_with_inventory
+        # Normalize product names for case-insensitive matching
+        headset_filtered['Product Name Normalized'] = headset_filtered['Product Name'].str.lower().str.strip()
         
-        # FIXED: Group by Product Name to get totals across all stores
-        # Only count stores that actually have inventory for this product
-        headset_summary = headset_filtered.groupby(['Product Name', 'Brand', 'Flower Category', 'Product Base Name', 'Weight']).agg({
+        # Count stores with inventory for each product
+        def count_stores_with_inventory(group):
+            return group[group['Total Quantity on Hand'] > 0]['Store Name'].nunique()
+        
+        # Aggregate across all stores
+        headset_summary = headset_filtered.groupby([
+            'Product Name', 'Brand', 'Flower Category', 'Product Base Name', 'Weight', 'Product Name Normalized'
+        ]).agg({
             'Total Quantity on Hand': 'sum',
             'In Stock Avg Units per Day': 'sum'
         }).reset_index()
         
-        # Calculate store count with inventory separately
-        store_counts = headset_filtered.groupby(['Product Name']).apply(count_stores_with_inventory).reset_index()
-        store_counts.columns = ['Product Name', 'Store Count']
+        # Calculate store counts separately
+        store_counts = headset_filtered.groupby('Product Name Normalized').apply(
+            count_stores_with_inventory
+        ).reset_index()
+        store_counts.columns = ['Product Name Normalized', 'Store Count']
         
-        # Merge store counts back
-        headset_summary = headset_summary.merge(store_counts, on='Product Name', how='left')
+        headset_summary = headset_summary.merge(store_counts, on='Product Name Normalized', how='left')
         headset_summary['Store Count'] = headset_summary['Store Count'].fillna(0)
         
-        # Filter out products with zero total inventory
+        # Filter out products with zero inventory
         headset_summary = headset_summary[headset_summary['Total Quantity on Hand'] > 0].copy()
         
         if headset_summary.empty:
-            st.warning("⚠️ No private label flower products with inventory found in Headset data")
+            st.warning("⚠️ No private label flower products with inventory found")
             return None
         
-        # Start with all Distru data
+        # =====================================================================
+        # PROCESS DISTRU DATA
+        # =====================================================================
+        
         distru_filtered = distru_df.copy()
         
-        # Handle different product name columns (Distru uses "Product", Headset uses "Product Name")
-        product_name_col = 'Product Name' if 'Product Name' in distru_filtered.columns else 'Product'
-        
-        # Standardize column name to match Headset
-        if product_name_col == 'Product':
+        # Standardize product name column
+        if 'Product Name' not in distru_filtered.columns and 'Product' in distru_filtered.columns:
             distru_filtered['Product Name'] = distru_filtered['Product']
         
-        # Extract brands from product names if Brand column doesn't exist
+        # Extract brands if needed
         if 'Brand' not in distru_filtered.columns:
             distru_filtered['Brand'] = distru_filtered['Product Name'].apply(extract_brand_from_product_name)
-            st.info("✅ Extracted brands from Distru product names")
         
-        # Debug: Show detected brands
-        detected_brands = distru_filtered['Brand'].dropna().unique()
-        st.info(f"🏷️ Brands found in Distru: {list(detected_brands)[:10]}...")  # Show first 10
+        # Filter to private label brands
+        distru_filtered = distru_filtered[distru_filtered['Brand'].isin(PRIVATE_LABEL_BRANDS)].copy()
         
-        # Filter Distru data to private label brands
-        matching_brands = [b for b in detected_brands if b in private_label_brands]
-        st.info(f"🎯 Matching private label brands: {matching_brands}")
-        
-        if matching_brands:
-            distru_filtered = distru_filtered[distru_filtered['Brand'].isin(private_label_brands)].copy()
-        else:
-            st.warning("⚠️ No matching private label brands found in Distru data")
-            distru_filtered = pd.DataFrame()  # Empty dataframe
-        
-        # Filter Distru to flower categories (only if we have data)
-        if not distru_filtered.empty and 'Category' in distru_filtered.columns:
+        # Filter to flower categories
+        if 'Category' in distru_filtered.columns:
+            distru_filtered['Flower Category'] = distru_filtered['Category'].apply(categorize_flower_type)
             distru_filtered = distru_filtered[
                 distru_filtered['Category'].str.lower().str.contains(
-                    '|'.join(flower_keywords), na=False
+                    '|'.join(FLOWER_KEYWORDS), na=False
                 )
             ].copy()
+        else:
+            distru_filtered['Flower Category'] = 'Unknown'
         
-        # Extract weights from Distru product names
-        if not distru_filtered.empty and 'Product Name' in distru_filtered.columns:
+        # Extract weights and normalize names
+        if 'Product Name' in distru_filtered.columns:
+            distru_filtered['Product Name Normalized'] = distru_filtered['Product Name'].str.lower().str.strip()
             distru_filtered[['Product Base Name', 'Weight']] = distru_filtered['Product Name'].apply(
                 lambda x: pd.Series(extract_weight_from_product_name(x))
             )
         
-        # Find the quantity column in Distru data
+        # Find quantity column
         quantity_columns = ['Active Quantity', 'Quantity', 'Total Quantity', 'Available Quantity']
         distru_qty_col = None
         for col in quantity_columns:
@@ -447,39 +455,47 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
                 distru_qty_col = col
                 break
         
-        if distru_qty_col is None:
-            st.warning("⚠️ No quantity column found in Distru data. Proceeding with Headset data only.")
-            distru_summary = pd.DataFrame()
-        elif distru_filtered.empty:
-            st.warning("⚠️ No matching Distru products after filtering. Proceeding with Headset data only.")
+        # Aggregate Distru data
+        if distru_qty_col is None or distru_filtered.empty:
             distru_summary = pd.DataFrame()
         else:
-            st.success(f"✅ Found Distru quantity column: {distru_qty_col}")
-            
-            # Ensure all required columns exist before grouping
-            required_cols = ['Product Name', 'Brand', 'Product Base Name', 'Weight']
-            missing_cols = [col for col in required_cols if col not in distru_filtered.columns]
-            
-            if missing_cols:
-                st.error(f"❌ Missing columns in Distru data for grouping: {missing_cols}")
-                distru_summary = pd.DataFrame()
-            else:
-                # Group Distru data by Product Name
-                try:
-                    distru_summary = distru_filtered.groupby(['Product Name', 'Brand', 'Product Base Name', 'Weight']).agg({
-                        distru_qty_col: 'sum'
-                    }).reset_index()
-                    distru_summary.rename(columns={distru_qty_col: 'Distru Quantity'}, inplace=True)
-                    st.success(f"✅ Processed {len(distru_summary)} Distru products")
-                except Exception as e:
-                    st.error(f"❌ Error grouping Distru data: {str(e)}")
-                    distru_summary = pd.DataFrame()
+            distru_summary = distru_filtered.groupby([
+                'Product Name', 'Product Name Normalized', 'Brand', 'Product Base Name', 'Weight', 'Flower Category'
+            ]).agg({
+                distru_qty_col: 'sum'
+            }).reset_index()
+            distru_summary.rename(columns={distru_qty_col: 'Distru Quantity'}, inplace=True)
         
-        # Merge Headset and Distru data
+        # =====================================================================
+        # MERGE HEADSET AND DISTRU DATA
+        # =====================================================================
+        
         if not distru_summary.empty:
+            # Find products in Distru but not in stores
+            distru_only_products = distru_summary[
+                ~distru_summary['Product Name Normalized'].isin(headset_summary['Product Name Normalized'])
+            ]
+            
+            # Add Distru-only products to dataset
+            if not distru_only_products.empty:
+                for _, row in distru_only_products.iterrows():
+                    new_row = {
+                        'Product Name': row['Product Name'],
+                        'Product Name Normalized': row['Product Name Normalized'],
+                        'Brand': row['Brand'],
+                        'Flower Category': row.get('Flower Category', 'Unknown'),
+                        'Product Base Name': row['Product Base Name'],
+                        'Weight': row['Weight'],
+                        'Total Quantity on Hand': 0,
+                        'In Stock Avg Units per Day': MIN_DAILY_SALES,
+                        'Store Count': 0
+                    }
+                    headset_summary = pd.concat([headset_summary, pd.DataFrame([new_row])], ignore_index=True)
+            
+            # Merge on normalized names (case-insensitive)
             combined = headset_summary.merge(
-                distru_summary[['Product Name', 'Distru Quantity']], 
-                on='Product Name', 
+                distru_summary[['Product Name Normalized', 'Distru Quantity']], 
+                on='Product Name Normalized', 
                 how='left'
             )
             combined['Distru Quantity'] = combined['Distru Quantity'].fillna(0)
@@ -487,7 +503,11 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
             combined = headset_summary.copy()
             combined['Distru Quantity'] = 0
         
-        # Calculate total inventory and WOH
+        # =====================================================================
+        # CALCULATE METRICS
+        # =====================================================================
+        
+        # Total inventory
         combined['Total Inventory'] = combined['Total Quantity on Hand'] + combined['Distru Quantity']
         
         # Filter out products with zero total inventory
@@ -497,20 +517,24 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
             st.warning("⚠️ No products with inventory found after combining data")
             return None
         
+        # Calculate WOH
         combined['WOH'] = combined.apply(
             lambda row: calculate_woh(row['Total Inventory'], row['In Stock Avg Units per Day']), 
             axis=1
         )
         
-        # Calculate Days of Supply for Distru (Distru Quantity / Total Daily Sales)
+        # Calculate Distru Days Supply
         combined['Distru Days Supply'] = combined.apply(
             lambda row: math.floor(row['Distru Quantity'] / row['In Stock Avg Units per Day']) 
-            if row['In Stock Avg Units per Day'] > 0 else 0,
+            if row['In Stock Avg Units per Day'] >= MIN_DAILY_SALES else 0,
             axis=1
         )
         
-        # Create Product Group (Brand + Weight) for better grouping
+        # Create Product Group for categorization
         combined['Product Group'] = combined['Brand'] + ' ' + combined['Weight']
+        
+        # Drop normalized column - no longer needed
+        combined = combined.drop(columns=['Product Name Normalized'])
         
         return combined
         
@@ -525,30 +549,25 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
 def create_woh_summary_chart(df: pd.DataFrame) -> go.Figure:
     """Create WOH summary chart by brand and category"""
     try:
-        # Group by Brand and Flower Category
-        # CRITICAL: Don't sum WOH! Calculate from aggregated totals
         summary = df.groupby(['Brand', 'Flower Category']).agg({
             'Total Inventory': 'sum',
             'In Stock Avg Units per Day': 'sum',
-            'Product Name': 'nunique'  # Count unique products
+            'Product Name': 'nunique'
         }).reset_index()
         
-        # Calculate WOH from the aggregated totals
+        # Calculate WOH from aggregated totals (don't sum individual WOHs)
         summary['WOH'] = summary.apply(
             lambda row: calculate_woh(row['Total Inventory'], row['In Stock Avg Units per Day']),
             axis=1
         )
         
-        summary.rename(columns={'Product Name': 'Product Count'}, inplace=True)
-        
-        # Create bar chart
         fig = px.bar(
             summary, 
             x='Brand', 
             y='WOH',
             color='Flower Category',
             title='Weeks on Hand (WOH) by Brand and Category',
-            labels={'WOH': 'Total Weeks on Hand', 'Brand': 'Private Label Brand'},
+            labels={'WOH': 'Weeks on Hand', 'Brand': 'Private Label Brand'},
             height=500
         )
         
@@ -568,15 +587,12 @@ def create_woh_summary_chart(df: pd.DataFrame) -> go.Figure:
 def create_daily_sales_chart(df: pd.DataFrame) -> go.Figure:
     """Create daily sales performance chart by brand/weight combination"""
     try:
-        # Group by Product Group (Brand + Weight)
         sales_summary = df.groupby('Product Group').agg({
             'In Stock Avg Units per Day': 'sum'
         }).reset_index()
         
-        # Sort by daily sales descending
         sales_summary = sales_summary.sort_values('In Stock Avg Units per Day', ascending=False)
         
-        # Create bar chart
         fig = px.bar(
             sales_summary,
             x='Product Group',
@@ -602,9 +618,8 @@ def create_daily_sales_chart(df: pd.DataFrame) -> go.Figure:
         return go.Figure()
 
 def create_inventory_distribution_chart(df: pd.DataFrame) -> go.Figure:
-    """Create inventory distribution chart"""
+    """Create inventory distribution sunburst chart"""
     try:
-        # Group by Weight and Brand
         weight_summary = df.groupby(['Weight', 'Brand']).agg({
             'Total Inventory': 'sum',
             'Distru Quantity': 'sum'
@@ -627,24 +642,22 @@ def create_inventory_distribution_chart(df: pd.DataFrame) -> go.Figure:
 def create_distru_stock_table(df: pd.DataFrame) -> pd.DataFrame:
     """Create summary table for products in stock at Distru"""
     try:
-        # Filter to products with Distru stock
         distru_stock = df[df['Distru Quantity'] > 0].copy()
         
         if distru_stock.empty:
             return pd.DataFrame()
         
-        # Create summary by Brand, Weight, and Category
         summary = distru_stock.groupby(['Brand', 'Weight', 'Flower Category']).agg({
             'Distru Quantity': 'sum',
             'Total Inventory': 'sum',
             'In Stock Avg Units per Day': 'sum',
-            'Product Name': 'nunique'  # Count unique products
+            'Product Name': 'nunique'
         }).reset_index()
         
-        # Calculate Distru Days Supply and WOH properly
+        # Calculate metrics from aggregated values
         summary['Distru Days Supply'] = summary.apply(
             lambda row: math.floor(row['Distru Quantity'] / row['In Stock Avg Units per Day']) 
-            if row['In Stock Avg Units per Day'] > 0 else 0,
+            if row['In Stock Avg Units per Day'] >= MIN_DAILY_SALES else 0,
             axis=1
         )
         
@@ -654,9 +667,11 @@ def create_distru_stock_table(df: pd.DataFrame) -> pd.DataFrame:
         )
         
         summary.rename(columns={'Product Name': 'Products at Distro'}, inplace=True)
-        summary = summary[['Brand', 'Weight', 'Flower Category', 'Products at Distro', 'Distru Quantity', 'Distru Days Supply', 'Total Inventory', 'In Stock Avg Units per Day', 'WOH']]
+        summary = summary[[
+            'Brand', 'Weight', 'Flower Category', 'Products at Distro', 
+            'Distru Quantity', 'Distru Days Supply', 'Total Inventory', 'In Stock Avg Units per Day', 'WOH'
+        ]]
         
-        # Sort by Brand, Weight, then category order (Indica, Hybrid, Sativa)
         summary = summary.sort_values(['Brand', 'Weight'])
         summary = sort_by_category_order(summary, 'Flower Category')
         
@@ -669,7 +684,6 @@ def create_distru_stock_table(df: pd.DataFrame) -> pd.DataFrame:
 def create_expandable_product_summary(df: pd.DataFrame):
     """Create expandable product summary with drill-down by category"""
     
-    # Only show products with inventory > 0
     df_with_inventory = df[df['Total Inventory'] > 0].copy()
     
     if df_with_inventory.empty:
@@ -677,7 +691,6 @@ def create_expandable_product_summary(df: pd.DataFrame):
         return
     
     # Group by Product Group (Brand + Weight)
-    # CRITICAL: Calculate WOH from aggregated totals, don't sum individual WOHs
     product_groups = df_with_inventory.groupby('Product Group').agg({
         'Total Inventory': 'sum',
         'Distru Quantity': 'sum',
@@ -686,7 +699,7 @@ def create_expandable_product_summary(df: pd.DataFrame):
         'Store Count': 'sum'
     }).reset_index()
     
-    # Calculate WOH properly from aggregated values
+    # Calculate WOH from aggregated values
     product_groups['WOH'] = product_groups.apply(
         lambda row: calculate_woh(row['Total Inventory'], row['In Stock Avg Units per Day']),
         axis=1
@@ -709,13 +722,11 @@ def create_expandable_product_summary(df: pd.DataFrame):
         woh = group_row['WOH']
         daily_sales = group_row['In Stock Avg Units per Day']
         
-        # Create expandable section for each product group
         with st.expander(f"**{product_group}** - {total_products} products, {distro_products} at Distro, {woh:.1f} WOH, {daily_sales:.1f} daily sales"):
             
-            # Get products for this group (with inventory only)
             group_products = df_with_inventory[df_with_inventory['Product Group'] == product_group]
             
-            # Summary by category - calculate WOH properly
+            # Category summary
             category_agg = group_products.groupby('Flower Category').agg({
                 'Total Inventory': 'sum',
                 'Distru Quantity': 'sum',
@@ -723,7 +734,6 @@ def create_expandable_product_summary(df: pd.DataFrame):
                 'Product Name': 'nunique'
             }).reset_index()
             
-            # Calculate WOH from aggregated values
             category_agg['WOH'] = category_agg.apply(
                 lambda row: calculate_woh(row['Total Inventory'], row['In Stock Avg Units per Day']),
                 axis=1
@@ -734,53 +744,48 @@ def create_expandable_product_summary(df: pd.DataFrame):
             category_summary = category_agg.merge(distro_by_category, on='Flower Category', how='left')
             category_summary['Distro Products'] = category_summary['Distro Products'].fillna(0).astype(int)
             
-            category_summary.rename(columns={'Product Name': 'Total Products'}, inplace=True)
-            category_summary = category_summary[['Flower Category', 'Total Products', 'Distro Products', 'Total Inventory', 'Distru Quantity', 'In Stock Avg Units per Day', 'WOH']]
+            category_summary.rename(columns={
+                'Product Name': 'Total Products',
+                'In Stock Avg Units per Day': 'Daily Sales'
+            }, inplace=True)
             
-            # Sort by category order: Indica, Hybrid, Sativa
+            category_summary = category_summary[[
+                'Flower Category', 'Total Products', 'Distro Products', 
+                'Total Inventory', 'Distru Quantity', 'Daily Sales', 'WOH'
+            ]]
+            
             category_summary = sort_by_category_order(category_summary, 'Flower Category')
+            category_summary = category_summary.round(1)
             
-            # Rename for display
-            category_summary_display = category_summary.rename(columns={'In Stock Avg Units per Day': 'Daily Sales'})
-            category_summary_display = category_summary_display.round(1)
-            
-            # Display category summary
             st.markdown("**📊 By Category:**")
-            st.dataframe(category_summary_display, use_container_width=True, hide_index=True)
+            st.dataframe(category_summary, use_container_width=True, hide_index=True)
             
-            # Individual products by category (only those with inventory)
+            # Individual products by category
             st.markdown("**🌿 Individual Products:**")
             
-            # Use fixed category order for display
-            category_order = ['Indica', 'Hybrid', 'Sativa', 'Unknown']
-            available_categories = [cat for cat in category_order if cat in group_products['Flower Category'].unique()]
-            
-            for category in available_categories:
-                category_products = group_products[group_products['Flower Category'] == category]
-                # Additional filter for products with inventory (should already be filtered, but double-check)
-                category_products = category_products[category_products['Total Inventory'] > 0]
+            for category in [cat for cat in CATEGORY_ORDER if cat in group_products['Flower Category'].unique()]:
+                category_products = group_products[
+                    (group_products['Flower Category'] == category) & 
+                    (group_products['Total Inventory'] > 0)
+                ]
                 
                 if not category_products.empty:
                     distro_count = len(category_products[category_products['Distru Quantity'] > 0])
                     total_count = len(category_products)
                     
                     with st.expander(f"    {category} ({total_count} products, {distro_count} at Distro)"):
-                        display_cols = [
+                        display_df = category_products[[
                             'Product Name', 'Total Inventory', 'Distru Quantity', 
                             'In Stock Avg Units per Day', 'WOH', 'Store Count'
-                        ]
+                        ]].copy()
                         
-                        category_display = category_products[display_cols].copy()
+                        display_df = display_df.rename(columns={'In Stock Avg Units per Day': 'Daily Sales'})
                         
-                        # Rename for display
-                        category_display = category_display.rename(columns={'In Stock Avg Units per Day': 'Daily Sales'})
+                        for col in ['Total Inventory', 'Distru Quantity', 'Daily Sales', 'WOH']:
+                            if col in display_df.columns:
+                                display_df[col] = display_df[col].round(1)
                         
-                        numeric_cols = ['Total Inventory', 'Distru Quantity', 'Daily Sales', 'WOH']
-                        for col in numeric_cols:
-                            if col in category_display.columns:
-                                category_display[col] = category_display[col].round(1)
-                        
-                        st.dataframe(category_display, use_container_width=True, hide_index=True)
+                        st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 # =============================================================================
 # STREAMLIT UI
@@ -798,10 +803,10 @@ headset_file = st.sidebar.file_uploader(
 st.sidebar.subheader("📦 Distru Inventory Assets")
 distru_file = st.sidebar.file_uploader(
     "Choose Distru CSV", type=['csv'], key="distru_upload",
-    help="Upload the inventory assets report from Distru (will skip metadata rows)"
+    help="Upload the inventory assets report from Distru"
 )
 
-# Display private label brands being tracked
+# Display private label brands
 st.sidebar.markdown("---")
 st.sidebar.subheader("🏷️ Private Label Brands")
 st.sidebar.caption(f"Tracking {len(PRIVATE_LABEL_BRANDS)} brands:")
@@ -810,8 +815,7 @@ with st.sidebar.expander("View Brands"):
         st.markdown(f"• {brand}")
 
 # Process Data Button
-if st.sidebar.button("🚀 Process Data", type="primary", 
-                    disabled=not (headset_file and distru_file)):
+if st.sidebar.button("🚀 Process Data", type="primary", disabled=not (headset_file and distru_file)):
     with st.spinner("Processing your data..."):
         # Load CSV files
         headset_df = load_headset_data(headset_file)
@@ -826,18 +830,7 @@ if st.sidebar.button("🚀 Process Data", type="primary",
         st.session_state.distru_data = distru_df
         
         # Display file info
-        file_info = (f"Headset: {len(headset_df):,} rows | "
-                    f"Distru: {len(distru_df):,} rows | "
-                    f"Brands: {len(PRIVATE_LABEL_BRANDS)} brands")
-        st.success("✅ Files loaded successfully!")
-        st.info(file_info)
-        
-        # Show detected brands in Distru data
-        if 'Brand' in distru_df.columns or 'Product' in distru_df.columns or 'Product Name' in distru_df.columns:
-            # We'll extract brands during processing
-            pass
-        else:
-            st.warning("⚠️ No product or brand columns found in Distru data")
+        st.success(f"✅ Files loaded: Headset ({len(headset_df):,} rows) | Distru ({len(distru_df):,} rows)")
         
         # Combine and process data
         combined_data = combine_inventory_data(headset_df, distru_df)
@@ -865,15 +858,12 @@ if st.session_state.combined_data is not None:
         col1, col2, col3, col4, col5 = st.columns(5)
         
         with col1:
-            total_products = len(combined_df)
-            st.metric("Total Products", f"{total_products:,}")
+            st.metric("Total Products", f"{len(combined_df):,}")
             
         with col2:
-            total_inventory = combined_df['Total Inventory'].sum()
-            st.metric("Total Inventory", f"{total_inventory:,.0f}")
+            st.metric("Total Inventory", f"{combined_df['Total Inventory'].sum():,.0f}")
             
         with col3:
-            # Calculate total WOH properly from aggregated values
             total_inventory = combined_df['Total Inventory'].sum()
             total_daily_sales = combined_df['In Stock Avg Units per Day'].sum()
             total_woh = calculate_woh(total_inventory, total_daily_sales)
@@ -881,13 +871,12 @@ if st.session_state.combined_data is not None:
             
         with col4:
             distru_products = len(combined_df[combined_df['Distru Quantity'] > 0])
-            st.metric("Products at Distru", f"{distru_products}")
+            st.metric("Products at Distro", f"{distru_products}")
             
         with col5:
-            avg_daily_sales = combined_df['In Stock Avg Units per Day'].sum()
-            st.metric("Total Daily Sales", f"{avg_daily_sales:.1f}")
+            st.metric("Total Daily Sales", f"{total_daily_sales:.1f}")
         
-        # Daily Sales Performance Chart - Full Width
+        # Daily Sales Performance Chart
         st.subheader("📈 Daily Sales Performance by Product Type")
         daily_sales_chart = create_daily_sales_chart(combined_df)
         st.plotly_chart(daily_sales_chart, use_container_width=True)
@@ -902,6 +891,39 @@ if st.session_state.combined_data is not None:
         with col2:
             inventory_chart = create_inventory_distribution_chart(combined_df)
             st.plotly_chart(inventory_chart, use_container_width=True)
+        
+        # Brand breakdown table
+        st.subheader("📈 Brand Performance Summary")
+        brand_summary = combined_df.groupby('Brand').agg({
+            'Total Inventory': 'sum',
+            'Distru Quantity': 'sum',
+            'In Stock Avg Units per Day': 'sum',
+            'Product Name': 'nunique',
+            'Store Count': 'sum'
+        }).reset_index()
+        
+        brand_summary['WOH'] = brand_summary.apply(
+            lambda row: calculate_woh(row['Total Inventory'], row['In Stock Avg Units per Day']),
+            axis=1
+        )
+        
+        distru_products_by_brand = combined_df[combined_df['Distru Quantity'] > 0].groupby('Brand')['Product Name'].nunique().reset_index()
+        distru_products_by_brand.rename(columns={'Product Name': 'Distro Products'}, inplace=True)
+        brand_summary = brand_summary.merge(distru_products_by_brand, on='Brand', how='left')
+        brand_summary['Distro Products'] = brand_summary['Distro Products'].fillna(0).astype(int)
+        
+        brand_summary.rename(columns={
+            'Product Name': 'Total Products',
+            'Store Count': 'Total Store Presence',
+            'In Stock Avg Units per Day': 'Daily Sales'
+        }, inplace=True)
+        
+        brand_summary = brand_summary[[
+            'Brand', 'Total Products', 'Distro Products', 'Total Inventory', 
+            'Distru Quantity', 'Daily Sales', 'WOH', 'Total Store Presence'
+        ]]
+        brand_summary = brand_summary.round(1)
+        st.dataframe(brand_summary, use_container_width=True)
         
         # Expandable product performance summary
         create_expandable_product_summary(combined_df)
@@ -952,7 +974,7 @@ if st.session_state.combined_data is not None:
             
             sort_ascending = st.checkbox("Sort ascending", value=False)
             
-            # Map display name back to column name for sorting
+            # Map display name to column name
             sort_column_map = {
                 'Daily Sales': 'In Stock Avg Units per Day',
                 'WOH': 'WOH',
@@ -963,24 +985,17 @@ if st.session_state.combined_data is not None:
             
             filtered_df_sorted = filtered_df.sort_values(sort_column_map[sort_by], ascending=sort_ascending)
             
-            # Display filtered data
             st.subheader(f"📋 Product Details ({len(filtered_df_sorted)} products)")
             
-            # Format display columns
-            display_columns = [
+            display_df = filtered_df_sorted[[
                 'Product Name', 'Brand', 'Flower Category', 'Weight',
                 'Total Inventory', 'Distru Quantity', 'In Stock Avg Units per Day',
                 'WOH', 'Distru Days Supply', 'Store Count'
-            ]
+            ]].copy()
             
-            display_df = filtered_df_sorted[display_columns].copy()
-            
-            # Rename for display
             display_df = display_df.rename(columns={'In Stock Avg Units per Day': 'Daily Sales'})
             
-            # Round numeric columns
-            numeric_columns = ['Total Inventory', 'Distru Quantity', 'Daily Sales', 'WOH', 'Distru Days Supply']
-            for col in numeric_columns:
+            for col in ['Total Inventory', 'Distru Quantity', 'Daily Sales', 'WOH', 'Distru Days Supply']:
                 if col in display_df.columns:
                     display_df[col] = display_df[col].round(1)
             
@@ -989,7 +1004,6 @@ if st.session_state.combined_data is not None:
     with tab3:
         st.header("📦 Products in Stock at Distru")
         
-        # Filter to products with Distru stock
         distru_stock_df = combined_df[combined_df['Distru Quantity'] > 0].copy()
         
         if distru_stock_df.empty:
@@ -997,21 +1011,17 @@ if st.session_state.combined_data is not None:
         else:
             st.success(f"✅ {len(distru_stock_df)} products in stock at Distru")
             
-            # Create summary table by Brand/Weight/Category
+            # Summary table
             distru_summary = create_distru_stock_table(combined_df)
             
             if not distru_summary.empty:
                 st.subheader("📊 Distru Stock Summary")
-                
-                # Rename for display
                 distru_summary_display = distru_summary.rename(columns={'In Stock Avg Units per Day': 'Daily Sales'})
-                
                 st.dataframe(distru_summary_display, use_container_width=True)
             
             # Detailed product list
             st.subheader("📋 Detailed Product List")
             
-            # Sort options for Distru products
             distru_sort_by = st.selectbox(
                 "Sort by",
                 options=['Distru Quantity', 'Distru Days Supply', 'WOH', 'Product Name'],
@@ -1023,20 +1033,14 @@ if st.session_state.combined_data is not None:
             
             distru_stock_sorted = distru_stock_df.sort_values(distru_sort_by, ascending=distru_sort_ascending)
             
-            # Display columns for Distru focus
-            distru_display_columns = [
+            distru_display_df = distru_stock_sorted[[
                 'Product Name', 'Brand', 'Flower Category', 'Weight',
                 'Distru Quantity', 'Distru Days Supply', 'Total Inventory', 'In Stock Avg Units per Day', 'WOH'
-            ]
+            ]].copy()
             
-            distru_display_df = distru_stock_sorted[distru_display_columns].copy()
-            
-            # Rename for display
             distru_display_df = distru_display_df.rename(columns={'In Stock Avg Units per Day': 'Daily Sales'})
             
-            # Round numeric columns
-            numeric_columns = ['Distru Quantity', 'Distru Days Supply', 'Total Inventory', 'Daily Sales', 'WOH']
-            for col in numeric_columns:
+            for col in ['Distru Quantity', 'Distru Days Supply', 'Total Inventory', 'Daily Sales', 'WOH']:
                 if col in distru_display_df.columns:
                     distru_display_df[col] = distru_display_df[col].round(1)
             
@@ -1048,13 +1052,11 @@ if st.session_state.combined_data is not None:
         # Export functionality
         st.subheader("💾 Export Data")
         
-        # Generate filename with timestamp
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         
         col1, col2 = st.columns(2)
         
         with col1:
-            # Export combined data
             csv_buffer = io.StringIO()
             combined_df.to_csv(csv_buffer, index=False)
             
@@ -1066,7 +1068,6 @@ if st.session_state.combined_data is not None:
             )
         
         with col2:
-            # Export Distru stock only
             distru_stock_df = combined_df[combined_df['Distru Quantity'] > 0]
             if not distru_stock_df.empty:
                 distru_csv_buffer = io.StringIO()
@@ -1079,10 +1080,9 @@ if st.session_state.combined_data is not None:
                     mime="text/csv"
                 )
         
-        # Display raw data
+        # Display raw data with search
         st.subheader("🔍 Complete Dataset")
         
-        # Add search functionality
         search_term = st.text_input("🔍 Search products (by name, brand, or category)")
         
         if search_term:
@@ -1104,67 +1104,25 @@ else:
         st.info("👈 Upload the required CSV files in the sidebar to get started")
         
         with st.expander("ℹ️ How it Works", expanded=True):
-            st.markdown("""
+            st.markdown(f"""
             **📊 Upload** → **🔄 Process** → **📈 Analyze** → **📋 Report**
             
             **Key Features:**
             - 🔗 Combines Headset and Distru inventory data
-            - 🧮 Calculates Weeks on Hand (WOH) automatically
+            - 🧮 Calculates Weeks on Hand (WOH) with outlier control (capped at {MAX_WOH_WEEKS:.0f} weeks)
             - 🌿 Focuses on flower products (Indica, Sativa, Hybrid)
-            - 📦 Identifies products in stock at Distru
+            - 📦 Tracks products in stock at distribution for production planning
+            - 🔤 Case-insensitive product matching across systems
             - 📊 Interactive dashboards and filtering
             - 💾 CSV export functionality
-            
-            **v1.6 UI Improvements:**
-            - ✅ **Daily Sales Performance Chart** - New chart showing sales by brand/weight combination
-            - ✅ **Clearer Column Naming** - "In Stock Avg Units per Day" renamed to "Daily Sales"
-            - ✅ **Enhanced Product Summary** - Headers now show WOH and daily sales together
-            
-            **v1.5 Streamlined:**
-            - ✅ **Hardcoded Brand List** - No more brand CSV upload needed
-            - ✅ **15 Private Label Brands** - Automatically tracks your portfolio
-            - ✅ **Faster Workflow** - Only 2 files to upload (Headset + Distru)
-            
-            **v1.4 Data Science Best Practices:**
-            - ✅ **WOH Outlier Control** - Caps at 52 weeks (1 year) to prevent skewed graphs
-            - ✅ **Insufficient Data Handling** - Products with < 0.1 daily sales capped at max WOH
-            - ✅ **Consistent Category Ordering** - Always displays Indica → Hybrid → Sativa
-            - ✅ **Better Data Quality** - Prevents new product rollouts from distorting analytics
-            
-            **Why 52 weeks?** Beyond 1 year of supply is effectively "infinite" for planning purposes. 
-            Capping prevents products with very low sales from dominating aggregate metrics.
-            
-            **v1.3 Previous Fixes:**
-            - ✅ **WOH Calculation Fixed** - Now calculates from aggregated totals, not summing individual WOHs
-            - ✅ **Distro Product Counts** - Shows how many products are in-stock at distribution facility
-            - ✅ **Production Red Flags** - Track out-of-stocks at Distro for production planning
-            - ✅ **Accurate Metrics** - Brand summary now shows "Total Products" and "Distro Products"
-            
-            **Example:** Black Label 3.5g Hybrid showing "11 products, 4 at Distro, 16.2 WOH"
-            
-            **v1.2 Previous Improvements:**
-            - ✅ **Private Label Filtering Fixed** - Now properly filters to only private label brands
-            - ✅ **Category Normalization** - Handles "Flower (Indica)" patterns, shows only Indica/Sativa/Hybrid
-            - ✅ **Inventory-Only Display** - Only shows products with inventory > 0 (hides sold-out products)
-            - ✅ **Accurate Store Counts** - Only counts stores that actually have the product in stock
-            - ✅ **Better Debug Info** - Shows filtering results and brand matching details
-            
-            **v1.1 Previous Improvements:**
-            - ✅ **Fixed Distru Data Loading** - Properly skips metadata rows and finds Active Quantity
-            - ✅ **Brand Extraction** - Extracts brands from Distru product names (text before hyphen)
-            - ✅ **Fixed Product Counting** - No more double counting of products across stores
-            - ✅ **Drill-down Categories** - Expandable product groups with category breakdown
-            - ✅ **Product Grouping** - Groups by Brand + Weight (e.g., "Block Party 28g" vs "Block Party 7g")
-            - ✅ **Accurate Store Presence** - Counts unique stores per product correctly
             
             **Data Requirements:**
             - **Headset CSV:** Store Name, Product Name, Brand, Category, Total Quantity on Hand, In Stock Avg Units per Day
             - **Distru CSV:** Product (or Product Name), Active Quantity (skips first 2 metadata rows automatically)
             
-            **Brand Extraction Examples:**
-            - "Black Label - Cherry Warheads 3.5g" → Brand: "Black Label"
-            - "Block Party - Lemon Cherry Gelato 28g" → Brand: "Block Party"
-            - "Dope St. - Gelonade 14g" → Brand: "Dope St."
+            **Tracked Brands:** {len(PRIVATE_LABEL_BRANDS)} private label brands (see sidebar)
+            
+            **Version:** {st.session_state.app_version} - Production Ready
             """)
     
     elif headset_file and distru_file:
