@@ -4,18 +4,19 @@ Private Label Production Summary
 
 A Streamlit application for automating weekly private label inventory reporting.
 Processes Headset inventory coverage and Distru inventory assets reports to calculate
-Weeks on Hand (WOH) and generate production insights for private label flower products.
+Weeks on Hand (WOH) and generate production insights for private label products.
 
 Author: DC Retail
-Version: 1.8 - Production Ready
+Version: 2.3 - Emergency fix for FLOWER_KEYWORDS reference
 Date: 2025
 
 Key Features:
 - Combines retail (Headset) and distribution (Distru) inventory data
 - Calculates Weeks on Hand (WOH) with outlier control
 - Tracks products in stock at distribution for production planning
-- Case-insensitive product matching across systems
+- Case-insensitive product and brand matching across systems
 - Interactive dashboards with drill-down capabilities
+- Supports Flower (Indica/Sativa/Hybrid), Preroll, and Vape categories
 """
 
 import streamlit as st
@@ -51,11 +52,16 @@ PRIVATE_LABEL_BRANDS = [
     'Side Hustle'
 ]
 
-# Flower category keywords for filtering
-FLOWER_KEYWORDS = ['indica', 'sativa', 'hybrid', 'flower']
+# Product category keywords for filtering
+# This filters to include: Flower (Indica/Sativa/Hybrid), Preroll, and Vape
+# We use keywords because Flower categories appear as "Flower (Indica)" etc.
+PRODUCT_KEYWORDS = ['indica', 'sativa', 'hybrid', 'flower', 'preroll', 'vape']
+
+# Backward compatibility alias (temporary - for tracking down reference)
+FLOWER_KEYWORDS = PRODUCT_KEYWORDS
 
 # Standard category order for consistent display
-CATEGORY_ORDER = ['Indica', 'Hybrid', 'Sativa', 'Unknown']
+CATEGORY_ORDER = ['Indica', 'Hybrid', 'Sativa', 'Preroll', 'Vape', 'Unknown']
 
 # WOH calculation parameters
 MAX_WOH_WEEKS = 52.0  # Cap at 1 year for outlier control
@@ -72,7 +78,7 @@ st.set_page_config(
 )
 
 st.title("📊 Private Label Production Summary")
-st.markdown("**DC Retail** | Weekly inventory analysis and production planning for private label products")
+st.markdown("**DC Retail** | Weekly inventory analysis and production planning for private label products (Flower, Preroll, Vape)")
 
 # =============================================================================
 # SESSION STATE MANAGEMENT
@@ -87,7 +93,7 @@ def initialize_session_state():
             st.session_state[var] = None
     
     if st.session_state.app_version is None:
-        st.session_state.app_version = "1.8"
+        st.session_state.app_version = "2.3"
 
 initialize_session_state()
 
@@ -168,37 +174,43 @@ def extract_brand_from_product_name(product_name: str) -> str:
             return ' '.join(parts[:2])
         return product_name
 
-def categorize_flower_type(category: str) -> str:
+def categorize_product_type(category: str) -> str:
     """
-    Standardize flower category names.
+    Standardize product category names.
     
-    Handles patterns like:
+    Simple categorization based on keywords:
     - "Flower (Indica)" → "Indica"
-    - "Flower (Sativa)" → "Sativa"
-    - "Indica" → "Indica"
+    - "Flower (Sativa)" → "Sativa"  
+    - "Flower (Hybrid)" → "Hybrid"
+    - "Preroll" → "Preroll"
+    - "Vape" → "Vape"
     
     Args:
-        category: Raw category string
+        category: Raw category string from data
         
     Returns:
-        Standardized category: Indica, Sativa, Hybrid, or Unknown
+        Standardized category: Indica, Sativa, Hybrid, Preroll, Vape, or Unknown
     """
     if pd.isna(category):
         return "Unknown"
     
     category = str(category).lower().strip()
     
-    # Handle "Flower (Type)" patterns
+    # Handle flower subcategories
     if 'indica' in category:
         return 'Indica'
     elif 'sativa' in category:
         return 'Sativa'
     elif 'hybrid' in category:
         return 'Hybrid'
-    elif category == 'flower':
+    # Handle prerolls and vapes
+    elif 'preroll' in category:
+        return 'Preroll'
+    elif 'vape' in category:
+        return 'Vape'
+    # Unknown for anything else
+    else:
         return 'Unknown'
-    
-    return category.title()
 
 def sort_by_category_order(df: pd.DataFrame, category_column: str = 'Flower Category') -> pd.DataFrame:
     """
@@ -357,19 +369,73 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
         # PROCESS HEADSET DATA
         # =====================================================================
         
-        # Filter to private label brands
-        headset_filtered = headset_df[headset_df['Brand'].isin(PRIVATE_LABEL_BRANDS)].copy()
+        # Normalize brand names for case-insensitive matching
+        # Headset uses title case (Pto, Mikrodose), we need to match our list (PTO, MikroDose)
+        headset_df_normalized = headset_df.copy()
+        headset_df_normalized['Brand Normalized'] = headset_df_normalized['Brand'].str.lower().str.strip()
+        
+        # Create normalized private label brands list for matching
+        private_label_brands_normalized = [brand.lower().strip() for brand in PRIVATE_LABEL_BRANDS]
+        
+        # Filter to private label brands using normalized names
+        headset_filtered = headset_df_normalized[
+            headset_df_normalized['Brand Normalized'].isin(private_label_brands_normalized)
+        ].copy()
+        
+        # Debug: Show brand filtering results
+        total_headset = len(headset_df)
+        filtered_headset = len(headset_filtered)
+        unique_brands_in_data = sorted(headset_df['Brand'].dropna().unique().tolist())
+        matched_brands = sorted(headset_filtered['Brand'].dropna().unique().tolist())
+        
+        st.info(f"📊 Headset Data: {filtered_headset:,} of {total_headset:,} products are private label")
+        
+        with st.expander("🔍 Brand Filtering Details"):
+            st.write(f"**Brands in Headset data ({len(unique_brands_in_data)}):**")
+            st.write(unique_brands_in_data)
+            st.write(f"**Matched private label brands ({len(matched_brands)}):**")
+            st.write(matched_brands)
+            
+            # Show expected vs actual for brands that should match
+            st.write("**Expected → Actual Matches:**")
+            for expected_brand in PRIVATE_LABEL_BRANDS:
+                actual_matches = [b for b in unique_brands_in_data if b.lower() == expected_brand.lower()]
+                if actual_matches:
+                    if actual_matches[0] != expected_brand:
+                        st.write(f"• {expected_brand} → {actual_matches[0]} ✅ (case normalized)")
+                    else:
+                        st.write(f"• {expected_brand} ✅ (exact match)")
+                else:
+                    st.write(f"• {expected_brand} ❌ (not found)")
+        
+        # Debug: Show unique stores
+        unique_stores = sorted(headset_df['Store Name'].dropna().unique().tolist())
+        st.success(f"🏪 Found {len(unique_stores)} stores: {', '.join(unique_stores)}")
         
         if headset_filtered.empty:
             st.warning("⚠️ No private label products found in Headset data")
             return None
         
         # Filter to flower categories
+        pre_category_filter = len(headset_filtered)
         headset_filtered = headset_filtered[
             headset_filtered['Category'].str.lower().str.contains(
                 '|'.join(FLOWER_KEYWORDS), na=False
             )
         ].copy()
+        post_category_filter = len(headset_filtered)
+        
+        st.info(f"🌿 Flower Products: {post_category_filter:,} of {pre_category_filter:,} private label products (filtered out {pre_category_filter - post_category_filter:,} non-flower)")
+        
+        # Debug: Show categories that were filtered out
+        if pre_category_filter != post_category_filter:
+            all_categories = headset_df[headset_df['Brand'].isin(PRIVATE_LABEL_BRANDS)]['Category'].dropna().unique()
+            flower_categories = headset_filtered['Category'].dropna().unique()
+            filtered_out_categories = sorted([cat for cat in all_categories if cat not in flower_categories])
+            
+            if filtered_out_categories:
+                with st.expander("🗂️ Filtered Out Categories (non-flower)"):
+                    st.write(filtered_out_categories)
         
         if headset_filtered.empty:
             st.warning("⚠️ No private label flower products found in Headset data")
@@ -379,7 +445,8 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
         headset_filtered[['Product Base Name', 'Weight']] = headset_filtered['Product Name'].apply(
             lambda x: pd.Series(extract_weight_from_product_name(x))
         )
-        headset_filtered['Flower Category'] = headset_filtered['Category'].apply(categorize_flower_type)
+        # Note: Column named "Flower Category" for backward compatibility, but includes all product types
+        headset_filtered['Flower Category'] = headset_filtered['Category'].apply(categorize_product_type)
         
         # Normalize product names for case-insensitive matching
         headset_filtered['Product Name Normalized'] = headset_filtered['Product Name'].str.lower().str.strip()
@@ -426,15 +493,22 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
         if 'Brand' not in distru_filtered.columns:
             distru_filtered['Brand'] = distru_filtered['Product Name'].apply(extract_brand_from_product_name)
         
-        # Filter to private label brands
-        distru_filtered = distru_filtered[distru_filtered['Brand'].isin(PRIVATE_LABEL_BRANDS)].copy()
+        # Normalize brand names for case-insensitive matching
+        distru_filtered['Brand Normalized'] = distru_filtered['Brand'].str.lower().str.strip()
         
-        # Filter to flower categories
+        # Filter to private label brands using normalized names
+        distru_filtered = distru_filtered[
+            distru_filtered['Brand Normalized'].isin(private_label_brands_normalized)
+        ].copy()
+        
+        # Filter to tracked product categories
+        # Includes: Flower (appears as "Flower (Indica)", etc.), Preroll, and Vape
         if 'Category' in distru_filtered.columns:
-            distru_filtered['Flower Category'] = distru_filtered['Category'].apply(categorize_flower_type)
+            # Note: Column named "Flower Category" for backward compatibility, but includes all product types
+            distru_filtered['Flower Category'] = distru_filtered['Category'].apply(categorize_product_type)
             distru_filtered = distru_filtered[
                 distru_filtered['Category'].str.lower().str.contains(
-                    '|'.join(FLOWER_KEYWORDS), na=False
+                    '|'.join(PRODUCT_KEYWORDS), na=False
                 )
             ].copy()
         else:
@@ -837,7 +911,7 @@ if st.sidebar.button("🚀 Process Data", type="primary", disabled=not (headset_
         
         if combined_data is not None:
             st.session_state.combined_data = combined_data
-            st.success(f"✅ Successfully processed {len(combined_data):,} private label flower products")
+            st.success(f"✅ Successfully processed {len(combined_data):,} private label products (Flower, Preroll, Vape)")
 
 # Sidebar - Version Info
 st.sidebar.markdown("---")
@@ -1110,11 +1184,12 @@ else:
             **Key Features:**
             - 🔗 Combines Headset and Distru inventory data
             - 🧮 Calculates Weeks on Hand (WOH) with outlier control (capped at {MAX_WOH_WEEKS:.0f} weeks)
-            - 🌿 Focuses on flower products (Indica, Sativa, Hybrid)
+            - 🌿 Tracks Flower (Indica/Sativa/Hybrid), Preroll, and Vape products
             - 📦 Tracks products in stock at distribution for production planning
-            - 🔤 Case-insensitive product matching across systems
+            - 🔤 Case-insensitive product and brand matching across systems
             - 📊 Interactive dashboards and filtering
             - 💾 CSV export functionality
+            - 🔍 Brand and store tracking verification
             
             **Data Requirements:**
             - **Headset CSV:** Store Name, Product Name, Brand, Category, Total Quantity on Hand, In Stock Avg Units per Day
@@ -1122,7 +1197,12 @@ else:
             
             **Tracked Brands:** {len(PRIVATE_LABEL_BRANDS)} private label brands (see sidebar)
             
-            **Version:** {st.session_state.app_version} - Production Ready
+            **Tracked Categories:** Flower (Indica, Sativa, Hybrid), Preroll, Vape
+            
+            **Note:** Brand matching is case-insensitive. Headset's "Pto" matches our "PTO", 
+            "Mikrodose" matches our "MikroDose", etc.
+            
+            **Version:** {st.session_state.app_version} - Fixed & Clarified
             """)
     
     elif headset_file and distru_file:
@@ -1139,4 +1219,4 @@ else:
 
 # Footer
 st.markdown("---")
-st.markdown(f"**Private Label Production Summary v{st.session_state.app_version}** | Built for DC Retail | Focus: Flower Products")
+st.markdown(f"**Private Label Production Summary v{st.session_state.app_version}** | Built for DC Retail | Tracks {len(PRIVATE_LABEL_BRANDS)} Private Label Brands")
