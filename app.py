@@ -7,7 +7,7 @@ Processes Headset inventory coverage and Distru inventory assets reports to calc
 Weeks on Hand (WOH) and generate production insights for private label products.
 
 Author: DC Retail
-Version: 2.3 - Emergency fix for FLOWER_KEYWORDS reference
+Version: 2.5 - Vape breakdown by keyword type
 Date: 2025
 
 Key Features:
@@ -15,6 +15,7 @@ Key Features:
 - Calculates Weeks on Hand (WOH) with outlier control
 - Tracks products in stock at distribution for production planning
 - Case-insensitive product and brand matching across systems
+- Vape keyword extraction with breakdown by type
 - Interactive dashboards with drill-down capabilities
 - Supports Flower (Indica/Sativa/Hybrid), Preroll, and Vape categories
 """
@@ -57,9 +58,6 @@ PRIVATE_LABEL_BRANDS = [
 # We use keywords because Flower categories appear as "Flower (Indica)" etc.
 PRODUCT_KEYWORDS = ['indica', 'sativa', 'hybrid', 'flower', 'preroll', 'vape']
 
-# Backward compatibility alias (temporary - for tracking down reference)
-FLOWER_KEYWORDS = PRODUCT_KEYWORDS
-
 # Standard category order for consistent display
 CATEGORY_ORDER = ['Indica', 'Hybrid', 'Sativa', 'Preroll', 'Vape', 'Unknown']
 
@@ -93,7 +91,7 @@ def initialize_session_state():
             st.session_state[var] = None
     
     if st.session_state.app_version is None:
-        st.session_state.app_version = "2.3"
+        st.session_state.app_version = "2.5"
 
 initialize_session_state()
 
@@ -174,6 +172,36 @@ def extract_brand_from_product_name(product_name: str) -> str:
             return ' '.join(parts[:2])
         return product_name
 
+def extract_vape_keywords(product_name: str) -> str:
+    """
+    Extract vape-specific keywords from product name.
+    Based on price-checker v4 vape keyword extraction logic.
+    
+    Args:
+        product_name: Full product name
+        
+    Returns:
+        Comma-separated string of found keywords, or empty string if none found
+        
+    Examples:
+        "Curepen Originals - Blue Dream 1g" → "originals, curepen"
+        "DNA Live Resin - Wedding Cake 1g" → "dna, live resin"
+    """
+    if pd.isna(product_name) or not isinstance(product_name, str):
+        return ""
+    
+    product_lower = str(product_name).lower()
+    
+    # Vape keywords from price-checker v4
+    vape_keywords = [
+        'originals', 'ascnd', 'dna', 'exotics', 'disposable', 
+        'live resin', 'reload', 'rtu', 'curepen', 'curebar'
+    ]
+    
+    found_keywords = [keyword for keyword in vape_keywords if keyword in product_lower]
+    
+    return ', '.join(found_keywords) if found_keywords else ""
+
 def categorize_product_type(category: str) -> str:
     """
     Standardize product category names.
@@ -214,7 +242,7 @@ def categorize_product_type(category: str) -> str:
 
 def sort_by_category_order(df: pd.DataFrame, category_column: str = 'Flower Category') -> pd.DataFrame:
     """
-    Sort dataframe by standard category order: Indica, Hybrid, Sativa, Unknown.
+    Sort dataframe by standard category order: Indica, Hybrid, Sativa, Preroll, Vape, Unknown.
     
     Args:
         df: DataFrame to sort
@@ -356,6 +384,7 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
     4. Aggregate Distru data
     5. Add Distru-only products (not in stores)
     6. Merge datasets and calculate metrics
+    7. Extract Vape keywords for Vape products
     
     Args:
         headset_df: Headset inventory coverage report
@@ -416,36 +445,35 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
             st.warning("⚠️ No private label products found in Headset data")
             return None
         
-        # Filter to flower categories
+        # Filter to tracked product categories
         pre_category_filter = len(headset_filtered)
         headset_filtered = headset_filtered[
             headset_filtered['Category'].str.lower().str.contains(
-                '|'.join(FLOWER_KEYWORDS), na=False
+                '|'.join(PRODUCT_KEYWORDS), na=False
             )
         ].copy()
         post_category_filter = len(headset_filtered)
         
-        st.info(f"🌿 Flower Products: {post_category_filter:,} of {pre_category_filter:,} private label products (filtered out {pre_category_filter - post_category_filter:,} non-flower)")
+        st.info(f"🌿 Tracked Products: {post_category_filter:,} of {pre_category_filter:,} private label products (filtered out {pre_category_filter - post_category_filter:,} non-tracked)")
         
         # Debug: Show categories that were filtered out
         if pre_category_filter != post_category_filter:
             all_categories = headset_df[headset_df['Brand'].isin(PRIVATE_LABEL_BRANDS)]['Category'].dropna().unique()
-            flower_categories = headset_filtered['Category'].dropna().unique()
-            filtered_out_categories = sorted([cat for cat in all_categories if cat not in flower_categories])
+            tracked_categories = headset_filtered['Category'].dropna().unique()
+            filtered_out_categories = sorted([cat for cat in all_categories if cat not in tracked_categories])
             
             if filtered_out_categories:
-                with st.expander("🗂️ Filtered Out Categories (non-flower)"):
+                with st.expander("🗂️ Filtered Out Categories (non-tracked)"):
                     st.write(filtered_out_categories)
         
         if headset_filtered.empty:
-            st.warning("⚠️ No private label flower products found in Headset data")
+            st.warning("⚠️ No private label tracked products found in Headset data")
             return None
         
         # Extract product weights and standardize categories
         headset_filtered[['Product Base Name', 'Weight']] = headset_filtered['Product Name'].apply(
             lambda x: pd.Series(extract_weight_from_product_name(x))
         )
-        # Note: Column named "Flower Category" for backward compatibility, but includes all product types
         headset_filtered['Flower Category'] = headset_filtered['Category'].apply(categorize_product_type)
         
         # Normalize product names for case-insensitive matching
@@ -476,7 +504,7 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
         headset_summary = headset_summary[headset_summary['Total Quantity on Hand'] > 0].copy()
         
         if headset_summary.empty:
-            st.warning("⚠️ No private label flower products with inventory found")
+            st.warning("⚠️ No private label tracked products with inventory found")
             return None
         
         # =====================================================================
@@ -502,9 +530,7 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
         ].copy()
         
         # Filter to tracked product categories
-        # Includes: Flower (appears as "Flower (Indica)", etc.), Preroll, and Vape
         if 'Category' in distru_filtered.columns:
-            # Note: Column named "Flower Category" for backward compatibility, but includes all product types
             distru_filtered['Flower Category'] = distru_filtered['Category'].apply(categorize_product_type)
             distru_filtered = distru_filtered[
                 distru_filtered['Category'].str.lower().str.contains(
@@ -603,6 +629,18 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
             if row['In Stock Avg Units per Day'] >= MIN_DAILY_SALES else 0,
             axis=1
         )
+        
+        # Extract Vape keywords for Vape products
+        combined['Vape Keywords'] = combined.apply(
+            lambda row: extract_vape_keywords(row['Product Name']) if row['Flower Category'] == 'Vape' else '',
+            axis=1
+        )
+        
+        # Show extraction stats
+        vape_products = combined[combined['Flower Category'] == 'Vape']
+        if len(vape_products) > 0:
+            vape_with_keywords = vape_products[vape_products['Vape Keywords'] != '']
+            st.info(f"💨 Vape Products: Extracted keywords from {len(vape_with_keywords):,} of {len(vape_products):,} vape products")
         
         # Create Product Group for categorization
         combined['Product Group'] = combined['Brand'] + ' ' + combined['Weight']
@@ -756,7 +794,7 @@ def create_distru_stock_table(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
 def create_expandable_product_summary(df: pd.DataFrame):
-    """Create expandable product summary with drill-down by category"""
+    """Create expandable product summary with drill-down by category, with Vape breakdown by keywords"""
     
     df_with_inventory = df[df['Total Inventory'] > 0].copy()
     
@@ -847,19 +885,58 @@ def create_expandable_product_summary(df: pd.DataFrame):
                     distro_count = len(category_products[category_products['Distru Quantity'] > 0])
                     total_count = len(category_products)
                     
-                    with st.expander(f"    {category} ({total_count} products, {distro_count} at Distro)"):
-                        display_df = category_products[[
-                            'Product Name', 'Total Inventory', 'Distru Quantity', 
-                            'In Stock Avg Units per Day', 'WOH', 'Store Count'
-                        ]].copy()
+                    # Special handling for Vape - break down by keywords
+                    if category == 'Vape':
+                        st.markdown(f"    **💨 {category} ({total_count} products, {distro_count} at Distro)**")
                         
-                        display_df = display_df.rename(columns={'In Stock Avg Units per Day': 'Daily Sales'})
+                        # Group vape products by their keywords
+                        vape_by_keywords = category_products.groupby('Vape Keywords')
                         
-                        for col in ['Total Inventory', 'Distru Quantity', 'Daily Sales', 'WOH']:
-                            if col in display_df.columns:
-                                display_df[col] = display_df[col].round(1)
+                        # Sort by keywords - put empty keywords last
+                        sorted_keyword_groups = sorted(vape_by_keywords.groups.keys(), 
+                                                      key=lambda x: (x == '', x))
                         
-                        st.dataframe(display_df, use_container_width=True, hide_index=True)
+                        for vape_keywords in sorted_keyword_groups:
+                            keyword_products = vape_by_keywords.get_group(vape_keywords)
+                            keyword_distro_count = len(keyword_products[keyword_products['Distru Quantity'] > 0])
+                            keyword_total_count = len(keyword_products)
+                            
+                            # Display label
+                            if vape_keywords:
+                                keyword_label = f"Vape - {vape_keywords}"
+                            else:
+                                keyword_label = "Vape - No Keywords"
+                            
+                            with st.expander(f"        {keyword_label} ({keyword_total_count} products, {keyword_distro_count} at Distro)"):
+                                display_columns = [
+                                    'Product Name', 'Total Inventory', 'Distru Quantity', 
+                                    'In Stock Avg Units per Day', 'WOH', 'Store Count'
+                                ]
+                                
+                                display_df = keyword_products[display_columns].copy()
+                                display_df = display_df.rename(columns={'In Stock Avg Units per Day': 'Daily Sales'})
+                                
+                                for col in ['Total Inventory', 'Distru Quantity', 'Daily Sales', 'WOH']:
+                                    if col in display_df.columns:
+                                        display_df[col] = display_df[col].round(1)
+                                
+                                st.dataframe(display_df, use_container_width=True, hide_index=True)
+                    else:
+                        # Non-Vape categories - display normally
+                        with st.expander(f"    {category} ({total_count} products, {distro_count} at Distro)"):
+                            display_columns = [
+                                'Product Name', 'Total Inventory', 'Distru Quantity', 
+                                'In Stock Avg Units per Day', 'WOH', 'Store Count'
+                            ]
+                            
+                            display_df = category_products[display_columns].copy()
+                            display_df = display_df.rename(columns={'In Stock Avg Units per Day': 'Daily Sales'})
+                            
+                            for col in ['Total Inventory', 'Distru Quantity', 'Daily Sales', 'WOH']:
+                                if col in display_df.columns:
+                                    display_df[col] = display_df[col].round(1)
+                            
+                            st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 # =============================================================================
 # STREAMLIT UI
@@ -1061,12 +1138,23 @@ if st.session_state.combined_data is not None:
             
             st.subheader(f"📋 Product Details ({len(filtered_df_sorted)} products)")
             
-            display_df = filtered_df_sorted[[
+            # Determine columns to display - include Vape Keywords for Vape products
+            base_columns = [
                 'Product Name', 'Brand', 'Flower Category', 'Weight',
                 'Total Inventory', 'Distru Quantity', 'In Stock Avg Units per Day',
                 'WOH', 'Distru Days Supply', 'Store Count'
-            ]].copy()
+            ]
             
+            # Check if any vape products are in the filtered data
+            has_vape = 'Vape' in filtered_df_sorted['Flower Category'].values
+            
+            if has_vape:
+                # Insert Vape Keywords column after Product Name
+                display_columns = base_columns[:1] + ['Vape Keywords'] + base_columns[1:]
+            else:
+                display_columns = base_columns
+            
+            display_df = filtered_df_sorted[display_columns].copy()
             display_df = display_df.rename(columns={'In Stock Avg Units per Day': 'Daily Sales'})
             
             for col in ['Total Inventory', 'Distru Quantity', 'Daily Sales', 'WOH', 'Distru Days Supply']:
@@ -1107,11 +1195,21 @@ if st.session_state.combined_data is not None:
             
             distru_stock_sorted = distru_stock_df.sort_values(distru_sort_by, ascending=distru_sort_ascending)
             
-            distru_display_df = distru_stock_sorted[[
-                'Product Name', 'Brand', 'Flower Category', 'Weight',
-                'Distru Quantity', 'Distru Days Supply', 'Total Inventory', 'In Stock Avg Units per Day', 'WOH'
-            ]].copy()
+            # Check if any vape products are in Distru stock
+            has_vape_in_distru = 'Vape' in distru_stock_sorted['Flower Category'].values
             
+            if has_vape_in_distru:
+                display_columns = [
+                    'Product Name', 'Vape Keywords', 'Brand', 'Flower Category', 'Weight',
+                    'Distru Quantity', 'Distru Days Supply', 'Total Inventory', 'In Stock Avg Units per Day', 'WOH'
+                ]
+            else:
+                display_columns = [
+                    'Product Name', 'Brand', 'Flower Category', 'Weight',
+                    'Distru Quantity', 'Distru Days Supply', 'Total Inventory', 'In Stock Avg Units per Day', 'WOH'
+                ]
+            
+            distru_display_df = distru_stock_sorted[display_columns].copy()
             distru_display_df = distru_display_df.rename(columns={'In Stock Avg Units per Day': 'Daily Sales'})
             
             for col in ['Distru Quantity', 'Distru Days Supply', 'Total Inventory', 'Daily Sales', 'WOH']:
@@ -1185,6 +1283,7 @@ else:
             - 🔗 Combines Headset and Distru inventory data
             - 🧮 Calculates Weeks on Hand (WOH) with outlier control (capped at {MAX_WOH_WEEKS:.0f} weeks)
             - 🌿 Tracks Flower (Indica/Sativa/Hybrid), Preroll, and Vape products
+            - 💨 **NEW:** Vape products broken down by keyword type (originals, dna, live resin, etc.)
             - 📦 Tracks products in stock at distribution for production planning
             - 🔤 Case-insensitive product and brand matching across systems
             - 📊 Interactive dashboards and filtering
@@ -1199,10 +1298,12 @@ else:
             
             **Tracked Categories:** Flower (Indica, Sativa, Hybrid), Preroll, Vape
             
+            **Vape Keywords Extracted:** originals, ascnd, dna, exotics, disposable, live resin, reload, rtu, curepen, curebar
+            
             **Note:** Brand matching is case-insensitive. Headset's "Pto" matches our "PTO", 
             "Mikrodose" matches our "MikroDose", etc.
             
-            **Version:** {st.session_state.app_version} - Fixed & Clarified
+            **Version:** {st.session_state.app_version} - Vape Breakdown by Keyword Type
             """)
     
     elif headset_file and distru_file:
