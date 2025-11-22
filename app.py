@@ -7,14 +7,14 @@ Processes Headset inventory coverage and Distru inventory assets reports to calc
 Weeks on Hand (WOH) and generate production insights for private label products.
 
 Author: DC Retail
-Version: 2.5 - Vape breakdown by keyword type
+Version: 2.5.1 - Brand normalization fix
 Date: 2025
 
 Key Features:
 - Combines retail (Headset) and distribution (Distru) inventory data
 - Calculates Weeks on Hand (WOH) with outlier control
 - Tracks products in stock at distribution for production planning
-- Case-insensitive product and brand matching across systems
+- Case-insensitive product and brand matching with normalization
 - Vape keyword extraction with breakdown by type
 - Interactive dashboards with drill-down capabilities
 - Supports Flower (Indica/Sativa/Hybrid), Preroll, and Vape categories
@@ -91,7 +91,7 @@ def initialize_session_state():
             st.session_state[var] = None
     
     if st.session_state.app_version is None:
-        st.session_state.app_version = "2.5"
+        st.session_state.app_version = "2.5.1"
 
 initialize_session_state()
 
@@ -201,6 +201,37 @@ def extract_vape_keywords(product_name: str) -> str:
     found_keywords = [keyword for keyword in vape_keywords if keyword in product_lower]
     
     return ', '.join(found_keywords) if found_keywords else ""
+
+def normalize_brand_name(brand: str) -> str:
+    """
+    Normalize brand name to match canonical private label brand names.
+    
+    Performs case-insensitive matching against PRIVATE_LABEL_BRANDS list
+    and returns the canonical name.
+    
+    Args:
+        brand: Brand name from data (e.g., "Pto", "mikrodose")
+        
+    Returns:
+        Canonical brand name (e.g., "PTO", "MikroDose") or original if no match
+        
+    Examples:
+        "Pto" → "PTO"
+        "mikrodose" → "MikroDose"
+        "black label" → "Black Label"
+    """
+    if pd.isna(brand):
+        return brand
+    
+    brand_lower = str(brand).lower().strip()
+    
+    # Find matching canonical brand name (case-insensitive)
+    for canonical_brand in PRIVATE_LABEL_BRANDS:
+        if canonical_brand.lower() == brand_lower:
+            return canonical_brand
+    
+    # If no match found, return original
+    return str(brand).strip()
 
 def categorize_product_type(category: str) -> str:
     """
@@ -380,11 +411,12 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
     Process:
     1. Filter both datasets to private label brands and flower categories
     2. Normalize product names for case-insensitive matching
-    3. Aggregate Headset data across all stores
-    4. Aggregate Distru data
-    5. Add Distru-only products (not in stores)
-    6. Merge datasets and calculate metrics
-    7. Extract Vape keywords for Vape products
+    3. Normalize brand names to canonical names
+    4. Aggregate Headset data across all stores
+    5. Aggregate Distru data
+    6. Add Distru-only products (not in stores)
+    7. Merge datasets and calculate metrics
+    8. Extract Vape keywords for Vape products
     
     Args:
         headset_df: Headset inventory coverage report
@@ -411,6 +443,9 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
             headset_df_normalized['Brand Normalized'].isin(private_label_brands_normalized)
         ].copy()
         
+        # Normalize brand names to canonical names (fixes "Pto" → "PTO")
+        headset_filtered['Brand'] = headset_filtered['Brand'].apply(normalize_brand_name)
+        
         # Debug: Show brand filtering results
         total_headset = len(headset_df)
         filtered_headset = len(headset_filtered)
@@ -431,7 +466,7 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
                 actual_matches = [b for b in unique_brands_in_data if b.lower() == expected_brand.lower()]
                 if actual_matches:
                     if actual_matches[0] != expected_brand:
-                        st.write(f"• {expected_brand} → {actual_matches[0]} ✅ (case normalized)")
+                        st.write(f"• {expected_brand} → {actual_matches[0]} → {expected_brand} ✅ (normalized)")
                     else:
                         st.write(f"• {expected_brand} ✅ (exact match)")
                 else:
@@ -528,6 +563,9 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
         distru_filtered = distru_filtered[
             distru_filtered['Brand Normalized'].isin(private_label_brands_normalized)
         ].copy()
+        
+        # Normalize brand names to canonical names (fixes "Pto" → "PTO")
+        distru_filtered['Brand'] = distru_filtered['Brand'].apply(normalize_brand_name)
         
         # Filter to tracked product categories
         if 'Category' in distru_filtered.columns:
@@ -994,6 +1032,7 @@ if st.sidebar.button("🚀 Process Data", type="primary", disabled=not (headset_
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 📋 App Info")
 st.sidebar.markdown(f"**Version:** {st.session_state.app_version}")
+st.sidebar.markdown("**Last Updated:** November 2025")
 
 # Main Content Area
 if st.session_state.combined_data is not None:
@@ -1285,7 +1324,7 @@ else:
             - 🌿 Tracks Flower (Indica/Sativa/Hybrid), Preroll, and Vape products
             - 💨 **NEW:** Vape products broken down by keyword type (originals, dna, live resin, etc.)
             - 📦 Tracks products in stock at distribution for production planning
-            - 🔤 Case-insensitive product and brand matching across systems
+            - 🔤 Case-insensitive product and brand matching with normalization
             - 📊 Interactive dashboards and filtering
             - 💾 CSV export functionality
             - 🔍 Brand and store tracking verification
@@ -1300,10 +1339,12 @@ else:
             
             **Vape Keywords Extracted:** originals, ascnd, dna, exotics, disposable, live resin, reload, rtu, curepen, curebar
             
-            **Note:** Brand matching is case-insensitive. Headset's "Pto" matches our "PTO", 
-            "Mikrodose" matches our "MikroDose", etc.
+            **Brand Normalization:** Automatically normalizes brand names to canonical form.
+            - "Pto" → "PTO"
+            - "mikrodose" → "MikroDose"
+            - "black label" → "Black Label"
             
-            **Version:** {st.session_state.app_version} - Vape Breakdown by Keyword Type
+            **Version:** {st.session_state.app_version}
             """)
     
     elif headset_file and distru_file:
