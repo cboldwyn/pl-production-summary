@@ -7,8 +7,8 @@ Processes Headset inventory coverage and Distru inventory assets reports to calc
 Weeks on Hand (WOH) and generate production insights for private label products.
 
 Author: DC Retail
-Version: 2.5.1 - Brand normalization fix
-Date: 2025
+Version: 3.0.0 - Persistent data + production flags
+Date: 2026
 
 Key Features:
 - Combines retail (Headset) and distribution (Distru) inventory data
@@ -18,12 +18,16 @@ Key Features:
 - Vape keyword extraction with breakdown by type
 - Interactive dashboards with drill-down capabilities
 - Supports Flower (Indica/Sativa/Hybrid), Preroll, and Vape categories
+- Persistent data: auto-saves processed data, loads on startup
+- Production flags: WOH alerts (warning/urgent/critical) and distro coverage gaps
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import io
+import os
+import json
 import math
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple
@@ -65,6 +69,16 @@ CATEGORY_ORDER = ['Indica', 'Hybrid', 'Sativa', 'Preroll', 'Vape', 'Unknown']
 MAX_WOH_WEEKS = 52.0  # Cap at 1 year for outlier control
 MIN_DAILY_SALES = 0.1  # Minimum threshold for reliable data
 
+# Production flag thresholds (weeks on hand)
+WOH_WARNING = 8       # Yellow flag
+WOH_URGENT = 4        # Red flag
+WOH_CRITICAL = 2      # Danger flag
+
+# Persistence paths
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+LATEST_DATA_PATH = os.path.join(DATA_DIR, "latest_combined.parquet")
+METADATA_PATH = os.path.join(DATA_DIR, "metadata.json")
+
 # =============================================================================
 # PAGE CONFIGURATION
 # =============================================================================
@@ -84,14 +98,14 @@ st.markdown("**DC Retail** | Weekly inventory analysis and production planning f
 
 def initialize_session_state():
     """Initialize session state variables for data persistence"""
-    session_vars = ['headset_data', 'distru_data', 'combined_data', 'processed_data', 'app_version']
-    
+    session_vars = ['headset_data', 'distru_data', 'combined_data', 'processed_data', 'app_version', 'saved_metadata']
+
     for var in session_vars:
         if var not in st.session_state:
             st.session_state[var] = None
-    
+
     if st.session_state.app_version is None:
-        st.session_state.app_version = "2.5.1"
+        st.session_state.app_version = "3.0.0"
 
 initialize_session_state()
 
@@ -322,6 +336,241 @@ def calculate_woh(total_inventory: float, daily_sales: float, max_woh: float = M
     return math.floor(woh * 10) / 10  # Round down to 1 decimal
 
 # =============================================================================
+# PERSISTENCE FUNCTIONS
+# =============================================================================
+
+def save_processed_data(df: pd.DataFrame, headset_filename: str, distru_filename: str,
+                        headset_rows: int, distru_rows: int) -> bool:
+    """
+    Save processed DataFrame and metadata to disk for persistence.
+
+    Args:
+        df: Combined processed DataFrame
+        headset_filename: Original Headset CSV filename
+        distru_filename: Original Distru CSV filename
+        headset_rows: Row count from Headset file
+        distru_rows: Row count from Distru file
+
+    Returns:
+        True on success, False on failure
+    """
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+
+        # Save DataFrame as Parquet (preserves dtypes)
+        save_df = df.copy()
+        # Convert Categorical columns to string for clean Parquet storage
+        for col in save_df.columns:
+            if hasattr(save_df[col], 'cat'):
+                save_df[col] = save_df[col].astype(str)
+        save_df.to_parquet(LATEST_DATA_PATH, index=False)
+
+        # Save metadata
+        metadata = {
+            'last_updated': datetime.now().isoformat(),
+            'headset_file': headset_filename,
+            'distru_file': distru_filename,
+            'headset_rows': headset_rows,
+            'distru_rows': distru_rows,
+            'product_count': len(df),
+            'app_version': '3.0.0'
+        }
+        with open(METADATA_PATH, 'w') as f:
+            json.dump(metadata, f, indent=2)
+
+        return True
+
+    except Exception as e:
+        st.warning(f"Could not save data to disk: {str(e)}")
+        return False
+
+
+def load_saved_data() -> Tuple[Optional[pd.DataFrame], Optional[dict]]:
+    """
+    Load previously saved DataFrame and metadata from disk.
+
+    Returns:
+        Tuple of (DataFrame, metadata_dict) or (None, None) if no saved data
+    """
+    try:
+        if not os.path.exists(LATEST_DATA_PATH) or not os.path.exists(METADATA_PATH):
+            return None, None
+
+        df = pd.read_parquet(LATEST_DATA_PATH)
+
+        with open(METADATA_PATH, 'r') as f:
+            metadata = json.load(f)
+
+        return df, metadata
+
+    except Exception:
+        return None, None
+
+
+# =============================================================================
+# PRODUCTION FLAG FUNCTIONS
+# =============================================================================
+
+def calculate_production_flags(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add WOH flag column to each product row based on inventory levels.
+
+    Flags:
+        - 'critical': WOH < 2 weeks (danger)
+        - 'urgent': WOH < 4 weeks (red)
+        - 'warning': WOH < 8 weeks (yellow)
+        - 'ok': WOH >= 8 weeks
+
+    Args:
+        df: Combined DataFrame with WOH column
+
+    Returns:
+        DataFrame with 'WOH Flag' column added
+    """
+    result = df.copy()
+
+    def assign_flag(woh):
+        if woh < WOH_CRITICAL:
+            return 'critical'
+        elif woh < WOH_URGENT:
+            return 'urgent'
+        elif woh < WOH_WARNING:
+            return 'warning'
+        else:
+            return 'ok'
+
+    result['WOH Flag'] = result['WOH'].apply(assign_flag)
+    return result
+
+
+def get_woh_alerts(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Get WOH alerts aggregated at Brand + Weight + Category level.
+
+    Calculates WOH from aggregated inventory and daily sales (not averaged),
+    then flags based on thresholds. Returns only flagged items, sorted by severity.
+
+    Args:
+        df: Combined DataFrame with inventory data
+
+    Returns:
+        DataFrame with columns: Brand, Weight, Flower Category, Total Inventory,
+        Distru Quantity, Daily Sales, WOH, Flag
+    """
+    summary = df.groupby(['Brand', 'Weight', 'Flower Category']).agg({
+        'Total Inventory': 'sum',
+        'Distru Quantity': 'sum',
+        'In Stock Avg Units per Day': 'sum',
+        'Product Name': 'nunique'
+    }).reset_index()
+
+    summary['WOH'] = summary.apply(
+        lambda row: calculate_woh(row['Total Inventory'], row['In Stock Avg Units per Day']),
+        axis=1
+    )
+
+    def assign_flag(woh):
+        if woh < WOH_CRITICAL:
+            return 'critical'
+        elif woh < WOH_URGENT:
+            return 'urgent'
+        elif woh < WOH_WARNING:
+            return 'warning'
+        else:
+            return 'ok'
+
+    summary['Flag'] = summary['WOH'].apply(assign_flag)
+    summary.rename(columns={
+        'Product Name': 'Products',
+        'In Stock Avg Units per Day': 'Daily Sales'
+    }, inplace=True)
+
+    # Filter to flagged items only, sort by severity
+    flag_order = {'critical': 0, 'urgent': 1, 'warning': 2}
+    flagged = summary[summary['Flag'] != 'ok'].copy()
+    flagged['_sort'] = flagged['Flag'].map(flag_order)
+    flagged = flagged.sort_values(['_sort', 'WOH']).drop(columns=['_sort'])
+
+    return flagged
+
+
+def get_distro_coverage_gaps(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Identify Brand + Weight + Category combinations where distro has zero inventory.
+
+    These represent gaps where stores cannot be replenished from distribution.
+
+    Args:
+        df: Combined DataFrame with inventory data
+
+    Returns:
+        DataFrame with columns: Brand, Weight, Flower Category, Retail Inventory,
+        Daily Sales, WOH (retail only), Products
+    """
+    summary = df.groupby(['Brand', 'Weight', 'Flower Category']).agg({
+        'Total Quantity on Hand': 'sum',
+        'Distru Quantity': 'sum',
+        'In Stock Avg Units per Day': 'sum',
+        'Product Name': 'nunique'
+    }).reset_index()
+
+    # Filter to combos where distro has zero
+    gaps = summary[summary['Distru Quantity'] == 0].copy()
+
+    if gaps.empty:
+        return gaps
+
+    # Calculate WOH from retail inventory only
+    gaps['WOH'] = gaps.apply(
+        lambda row: calculate_woh(row['Total Quantity on Hand'], row['In Stock Avg Units per Day']),
+        axis=1
+    )
+
+    gaps.rename(columns={
+        'Total Quantity on Hand': 'Retail Inventory',
+        'In Stock Avg Units per Day': 'Daily Sales',
+        'Product Name': 'Products'
+    }, inplace=True)
+
+    gaps = gaps.drop(columns=['Distru Quantity'])
+    gaps = gaps.sort_values('WOH')
+
+    return gaps
+
+
+def style_flag_dataframe(df: pd.DataFrame, flag_column: str = 'Flag'):
+    """
+    Apply conditional background colors to rows based on flag values.
+
+    Colors:
+        - critical: light red (#ffcccc)
+        - urgent: light orange (#ffe0cc)
+        - warning: light yellow (#fff3cc)
+        - ok: no styling
+
+    Args:
+        df: DataFrame to style
+        flag_column: Name of the column containing flag values
+
+    Returns:
+        Styled DataFrame for use with st.dataframe()
+    """
+    flag_colors = {
+        'critical': 'background-color: #ffcccc',
+        'urgent': 'background-color: #ffe0cc',
+        'warning': 'background-color: #fff3cc',
+        'ok': ''
+    }
+
+    def apply_row_style(row):
+        flag = row.get(flag_column, 'ok')
+        style = flag_colors.get(flag, '')
+        return [style] * len(row)
+
+    return df.style.apply(apply_row_style, axis=1)
+
+
+# =============================================================================
 # DATA LOADING FUNCTIONS
 # =============================================================================
 
@@ -446,36 +695,6 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
         # Normalize brand names to canonical names (fixes "Pto" → "PTO")
         headset_filtered['Brand'] = headset_filtered['Brand'].apply(normalize_brand_name)
         
-        # Debug: Show brand filtering results
-        total_headset = len(headset_df)
-        filtered_headset = len(headset_filtered)
-        unique_brands_in_data = sorted(headset_df['Brand'].dropna().unique().tolist())
-        matched_brands = sorted(headset_filtered['Brand'].dropna().unique().tolist())
-        
-        st.info(f"📊 Headset Data: {filtered_headset:,} of {total_headset:,} products are private label")
-        
-        with st.expander("🔍 Brand Filtering Details"):
-            st.write(f"**Brands in Headset data ({len(unique_brands_in_data)}):**")
-            st.write(unique_brands_in_data)
-            st.write(f"**Matched private label brands ({len(matched_brands)}):**")
-            st.write(matched_brands)
-            
-            # Show expected vs actual for brands that should match
-            st.write("**Expected → Actual Matches:**")
-            for expected_brand in PRIVATE_LABEL_BRANDS:
-                actual_matches = [b for b in unique_brands_in_data if b.lower() == expected_brand.lower()]
-                if actual_matches:
-                    if actual_matches[0] != expected_brand:
-                        st.write(f"• {expected_brand} → {actual_matches[0]} → {expected_brand} ✅ (normalized)")
-                    else:
-                        st.write(f"• {expected_brand} ✅ (exact match)")
-                else:
-                    st.write(f"• {expected_brand} ❌ (not found)")
-        
-        # Debug: Show unique stores
-        unique_stores = sorted(headset_df['Store Name'].dropna().unique().tolist())
-        st.success(f"🏪 Found {len(unique_stores)} stores: {', '.join(unique_stores)}")
-        
         if headset_filtered.empty:
             st.warning("⚠️ No private label products found in Headset data")
             return None
@@ -488,18 +707,6 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
             )
         ].copy()
         post_category_filter = len(headset_filtered)
-        
-        st.info(f"🌿 Tracked Products: {post_category_filter:,} of {pre_category_filter:,} private label products (filtered out {pre_category_filter - post_category_filter:,} non-tracked)")
-        
-        # Debug: Show categories that were filtered out
-        if pre_category_filter != post_category_filter:
-            all_categories = headset_df[headset_df['Brand'].isin(PRIVATE_LABEL_BRANDS)]['Category'].dropna().unique()
-            tracked_categories = headset_filtered['Category'].dropna().unique()
-            filtered_out_categories = sorted([cat for cat in all_categories if cat not in tracked_categories])
-            
-            if filtered_out_categories:
-                with st.expander("🗂️ Filtered Out Categories (non-tracked)"):
-                    st.write(filtered_out_categories)
         
         if headset_filtered.empty:
             st.warning("⚠️ No private label tracked products found in Headset data")
@@ -673,12 +880,6 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
             lambda row: extract_vape_keywords(row['Product Name']) if row['Flower Category'] == 'Vape' else '',
             axis=1
         )
-        
-        # Show extraction stats
-        vape_products = combined[combined['Flower Category'] == 'Vape']
-        if len(vape_products) > 0:
-            vape_with_keywords = vape_products[vape_products['Vape Keywords'] != '']
-            st.info(f"💨 Vape Products: Extracted keywords from {len(vape_with_keywords):,} of {len(vape_products):,} vape products")
         
         # Create Product Group for categorization
         combined['Product Group'] = combined['Brand'] + ' ' + combined['Weight']
@@ -905,7 +1106,12 @@ def create_expandable_product_summary(df: pd.DataFrame):
             ]]
             
             category_summary = sort_by_category_order(category_summary, 'Flower Category')
-            category_summary = category_summary.round(1)
+            for col in ['Total Inventory', 'Distru Quantity']:
+                if col in category_summary.columns:
+                    category_summary[col] = category_summary[col].astype(int)
+            for col in ['Daily Sales', 'WOH']:
+                if col in category_summary.columns:
+                    category_summary[col] = category_summary[col].round(1)
             
             st.markdown("**📊 By Category:**")
             st.dataframe(category_summary, use_container_width=True, hide_index=True)
@@ -954,7 +1160,10 @@ def create_expandable_product_summary(df: pd.DataFrame):
                                 display_df = keyword_products[display_columns].copy()
                                 display_df = display_df.rename(columns={'In Stock Avg Units per Day': 'Daily Sales'})
                                 
-                                for col in ['Total Inventory', 'Distru Quantity', 'Daily Sales', 'WOH']:
+                                for col in ['Total Inventory', 'Distru Quantity', 'Store Count']:
+                                    if col in display_df.columns:
+                                        display_df[col] = display_df[col].astype(int)
+                                for col in ['Daily Sales', 'WOH']:
                                     if col in display_df.columns:
                                         display_df[col] = display_df[col].round(1)
                                 
@@ -975,6 +1184,19 @@ def create_expandable_product_summary(df: pd.DataFrame):
                                     display_df[col] = display_df[col].round(1)
                             
                             st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+# =============================================================================
+# AUTO-LOAD SAVED DATA
+# =============================================================================
+
+if st.session_state.combined_data is None:
+    saved_df, saved_meta = load_saved_data()
+    if saved_df is not None:
+        # Ensure flag columns exist (handles pre-v3 saved data)
+        if 'WOH Flag' not in saved_df.columns:
+            saved_df = calculate_production_flags(saved_df)
+        st.session_state.combined_data = saved_df
+        st.session_state.saved_metadata = saved_meta
 
 # =============================================================================
 # STREAMLIT UI
@@ -1018,32 +1240,252 @@ if st.sidebar.button("🚀 Process Data", type="primary", disabled=not (headset_
         st.session_state.headset_data = headset_df
         st.session_state.distru_data = distru_df
         
-        # Display file info
-        st.success(f"✅ Files loaded: Headset ({len(headset_df):,} rows) | Distru ({len(distru_df):,} rows)")
-        
         # Combine and process data
         combined_data = combine_inventory_data(headset_df, distru_df)
-        
+
         if combined_data is not None:
+            combined_data = calculate_production_flags(combined_data)
             st.session_state.combined_data = combined_data
-            st.success(f"✅ Successfully processed {len(combined_data):,} private label products (Flower, Preroll, Vape)")
+
+            # Save to disk for persistence
+            saved = save_processed_data(
+                combined_data,
+                headset_file.name,
+                distru_file.name,
+                len(headset_df),
+                len(distru_df)
+            )
+            if saved:
+                st.session_state.saved_metadata = {
+                    'last_updated': datetime.now().isoformat(),
+                    'headset_file': headset_file.name,
+                    'distru_file': distru_file.name,
+                    'headset_rows': len(headset_df),
+                    'distru_rows': len(distru_df),
+                    'product_count': len(combined_data)
+                }
+
+            st.success(f"✅ Processed {len(combined_data):,} products. Data saved.")
 
 # Sidebar - Version Info
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 📋 App Info")
 st.sidebar.markdown(f"**Version:** {st.session_state.app_version}")
-st.sidebar.markdown("**Last Updated:** November 2025")
+st.sidebar.markdown("**Last Updated:** March 2026")
 
 # Main Content Area
 if st.session_state.combined_data is not None:
     combined_df = st.session_state.combined_data
-    
+
+    # Display data freshness
+    if st.session_state.saved_metadata:
+        meta = st.session_state.saved_metadata
+        try:
+            last_updated = datetime.fromisoformat(meta['last_updated'])
+            age = datetime.now() - last_updated
+            days_old = age.days
+            if days_old < 1:
+                freshness = "Today"
+            elif days_old < 2:
+                freshness = "Yesterday"
+            else:
+                freshness = f"{days_old} days old"
+            st.caption(
+                f"Data from: {last_updated.strftime('%A %m/%d/%Y %I:%M %p')} ({freshness}) | "
+                f"Sources: {meta.get('headset_file', 'N/A')}, {meta.get('distru_file', 'N/A')}"
+            )
+        except (KeyError, ValueError):
+            pass
+
     # Create tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard", "🎯 Product Analysis", "📦 Distru Stock", "📋 Raw Data"])
-    
+    tab0, tab1, tab2, tab3, tab4 = st.tabs(["🚨 Alerts", "📊 Dashboard", "🎯 Product Analysis", "📦 Distru Stock", "📋 Raw Data"])
+
+    # =========================================================================
+    # ALERTS TAB
+    # =========================================================================
+    with tab0:
+        st.header("🚨 Production Alerts")
+
+        # Build combined alerts report
+        woh_alerts = get_woh_alerts(combined_df)
+        distro_gaps = get_distro_coverage_gaps(combined_df)
+
+        # Merge WOH alerts and distro gaps into one table
+        # Start with full Brand+Weight+Category summary
+        full_summary = combined_df.groupby(['Brand', 'Weight', 'Flower Category']).agg({
+            'Total Inventory': 'sum',
+            'Distru Quantity': 'sum',
+            'In Stock Avg Units per Day': 'sum',
+            'Product Name': 'nunique'
+        }).reset_index()
+
+        full_summary['WOH'] = full_summary.apply(
+            lambda row: calculate_woh(row['Total Inventory'], row['In Stock Avg Units per Day']),
+            axis=1
+        )
+
+        def assign_flag(woh):
+            if woh < WOH_CRITICAL:
+                return 'CRITICAL'
+            elif woh < WOH_URGENT:
+                return 'URGENT'
+            elif woh < WOH_WARNING:
+                return 'WARNING'
+            return ''
+
+        full_summary['WOH Alert'] = full_summary['WOH'].apply(assign_flag)
+        full_summary['Distro Gap'] = full_summary['Distru Quantity'].apply(lambda x: 'NO STOCK' if x == 0 else '')
+
+        # Filter to only rows with at least one alert
+        alerts_combined = full_summary[
+            (full_summary['WOH Alert'] != '') | (full_summary['Distro Gap'] != '')
+        ].copy()
+
+        alerts_combined.rename(columns={
+            'Product Name': 'Products',
+            'In Stock Avg Units per Day': 'Daily Sales'
+        }, inplace=True)
+
+        # Sort by Brand, Weight, Category
+        alerts_combined = alerts_combined.sort_values(['Brand', 'Weight', 'Flower Category'])
+
+        # Format numbers
+        alerts_combined['Total Inventory'] = alerts_combined['Total Inventory'].astype(int)
+        alerts_combined['Distru Quantity'] = alerts_combined['Distru Quantity'].astype(int)
+        alerts_combined['Daily Sales'] = alerts_combined['Daily Sales'].apply(lambda x: f"{x:.1f}")
+        alerts_combined['WOH'] = alerts_combined['WOH'].apply(lambda x: f"{x:.1f}")
+
+        # Metric cards
+        critical_count = len(alerts_combined[alerts_combined['WOH Alert'] == 'CRITICAL'])
+        urgent_count = len(alerts_combined[alerts_combined['WOH Alert'] == 'URGENT'])
+        warning_count = len(alerts_combined[alerts_combined['WOH Alert'] == 'WARNING'])
+        gap_count = len(alerts_combined[alerts_combined['Distro Gap'] == 'NO STOCK'])
+
+        acol1, acol2, acol3, acol4 = st.columns(4)
+        with acol1:
+            st.metric("Critical (< 2 wks)", critical_count)
+        with acol2:
+            st.metric("Urgent (< 4 wks)", urgent_count)
+        with acol3:
+            st.metric("Warning (< 8 wks)", warning_count)
+        with acol4:
+            st.metric("Distro Gaps", gap_count)
+
+        if not alerts_combined.empty:
+            display_cols = ['Brand', 'Weight', 'Flower Category', 'Products',
+                           'Total Inventory', 'Distru Quantity', 'Daily Sales', 'WOH',
+                           'WOH Alert', 'Distro Gap']
+            display_alerts = alerts_combined[display_cols].copy()
+
+            # Color styling based on WOH Alert
+            flag_colors = {
+                'CRITICAL': 'background-color: #ffcccc',
+                'URGENT': 'background-color: #ffe0cc',
+                'WARNING': 'background-color: #fff3cc',
+                '': ''
+            }
+
+            def apply_alert_style(row):
+                woh_flag = row.get('WOH Alert', '')
+                distro_flag = row.get('Distro Gap', '')
+                # Prioritize WOH alert color, fall back to distro gap color
+                if woh_flag:
+                    style = flag_colors.get(woh_flag, '')
+                elif distro_flag:
+                    style = 'background-color: #ffe0cc'
+                else:
+                    style = ''
+                return [style] * len(row)
+
+            styled = display_alerts.style.apply(apply_alert_style, axis=1)
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+
+            # PDF export
+            st.subheader("Export")
+            report_date = datetime.now().strftime('%m/%d/%Y')
+            meta_line = ""
+            if st.session_state.saved_metadata:
+                try:
+                    lu = datetime.fromisoformat(st.session_state.saved_metadata['last_updated'])
+                    meta_line = f"Data from: {lu.strftime('%A %m/%d/%Y %I:%M %p')}"
+                except (KeyError, ValueError):
+                    pass
+
+            # Build HTML for PDF
+            rows_html = ""
+            for _, row in display_alerts.iterrows():
+                woh_flag = row['WOH Alert']
+                distro_flag = row['Distro Gap']
+                if woh_flag == 'CRITICAL':
+                    bg = '#ffcccc'
+                elif woh_flag == 'URGENT':
+                    bg = '#ffe0cc'
+                elif woh_flag == 'WARNING':
+                    bg = '#fff3cc'
+                elif distro_flag:
+                    bg = '#ffe0cc'
+                else:
+                    bg = '#ffffff'
+                rows_html += f"""<tr style="background-color:{bg}">
+                    <td>{row['Brand']}</td><td>{row['Weight']}</td><td>{row['Flower Category']}</td>
+                    <td style="text-align:right">{row['Products']}</td>
+                    <td style="text-align:right">{row['Total Inventory']}</td>
+                    <td style="text-align:right">{row['Distru Quantity']}</td>
+                    <td style="text-align:right">{row['Daily Sales']}</td>
+                    <td style="text-align:right">{row['WOH']}</td>
+                    <td>{row['WOH Alert']}</td><td>{row['Distro Gap']}</td>
+                </tr>"""
+
+            pdf_html = f"""<!DOCTYPE html>
+<html><head><style>
+    body {{ font-family: Arial, sans-serif; margin: 20px; font-size: 11px; }}
+    h1 {{ font-size: 18px; margin-bottom: 4px; }}
+    .meta {{ color: #666; margin-bottom: 12px; font-size: 10px; }}
+    .summary {{ margin-bottom: 12px; }}
+    .summary span {{ display: inline-block; padding: 4px 10px; margin-right: 8px; border-radius: 3px; font-weight: bold; font-size: 11px; }}
+    .critical {{ background: #ffcccc; }}
+    .urgent {{ background: #ffe0cc; }}
+    .warning {{ background: #fff3cc; }}
+    .gap {{ background: #e0e0e0; }}
+    table {{ border-collapse: collapse; width: 100%; }}
+    th {{ background: #333; color: white; padding: 6px 8px; text-align: left; font-size: 10px; }}
+    td {{ padding: 4px 8px; border-bottom: 1px solid #ddd; font-size: 10px; }}
+    @media print {{
+        body {{ margin: 10px; }}
+        * {{ -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; color-adjust: exact !important; }}
+    }}
+</style></head><body>
+<h1>Private Label Production Alerts</h1>
+<div class="meta">{report_date} | {meta_line}</div>
+<div class="summary">
+    <span class="critical">Critical: {critical_count}</span>
+    <span class="urgent">Urgent: {urgent_count}</span>
+    <span class="warning">Warning: {warning_count}</span>
+    <span class="gap">Distro Gaps: {gap_count}</span>
+</div>
+<table>
+<tr><th>Brand</th><th>Weight</th><th>Category</th><th>Products</th><th>Total Inv</th><th>Distru Qty</th><th>Daily Sales</th><th>WOH</th><th>WOH Alert</th><th>Distro Gap</th></tr>
+{rows_html}
+</table>
+</body></html>"""
+
+            st.download_button(
+                label="📄 Download Alerts Report (HTML/PDF)",
+                data=pdf_html,
+                file_name=f"pl_production_alerts_{datetime.now().strftime('%Y%m%d')}.html",
+                mime="text/html",
+                help="Open in browser and print to PDF, or save directly as HTML"
+            )
+
+        else:
+            st.success("No production alerts. All brand/weight/category combinations are healthy.")
+
+    # =========================================================================
+    # DASHBOARD TAB
+    # =========================================================================
     with tab1:
         st.header("📊 Private Label Inventory Dashboard")
-        
+
         # Key metrics
         col1, col2, col3, col4, col5 = st.columns(5)
         
@@ -1108,12 +1550,28 @@ if st.session_state.combined_data is not None:
             'In Stock Avg Units per Day': 'Daily Sales'
         }, inplace=True)
         
+        # Add WOH flags to brand summary
+        def assign_brand_flag(woh):
+            if woh < WOH_CRITICAL:
+                return 'critical'
+            elif woh < WOH_URGENT:
+                return 'urgent'
+            elif woh < WOH_WARNING:
+                return 'warning'
+            else:
+                return 'ok'
+
+        brand_summary['Flag'] = brand_summary['WOH'].apply(assign_brand_flag)
+
         brand_summary = brand_summary[[
-            'Brand', 'Total Products', 'Distro Products', 'Total Inventory', 
-            'Distru Quantity', 'Daily Sales', 'WOH', 'Total Store Presence'
+            'Brand', 'Total Products', 'Distro Products', 'Total Inventory',
+            'Distru Quantity', 'Daily Sales', 'WOH', 'Total Store Presence', 'Flag'
         ]]
-        brand_summary = brand_summary.round(1)
-        st.dataframe(brand_summary, use_container_width=True)
+        for col in ['Total Inventory', 'Distru Quantity', 'Total Store Presence']:
+            brand_summary[col] = brand_summary[col].astype(int)
+        brand_summary['Daily Sales'] = brand_summary['Daily Sales'].round(1)
+        brand_summary['WOH'] = brand_summary['WOH'].round(1)
+        st.dataframe(style_flag_dataframe(brand_summary), use_container_width=True, hide_index=True)
         
         # Expandable product performance summary
         create_expandable_product_summary(combined_df)
@@ -1177,36 +1635,52 @@ if st.session_state.combined_data is not None:
             
             st.subheader(f"📋 Product Details ({len(filtered_df_sorted)} products)")
             
-            # Determine columns to display - include Vape Keywords for Vape products
+            # Determine columns to display - include Vape Keywords for Vape products and WOH Flag
             base_columns = [
                 'Product Name', 'Brand', 'Flower Category', 'Weight',
                 'Total Inventory', 'Distru Quantity', 'In Stock Avg Units per Day',
                 'WOH', 'Distru Days Supply', 'Store Count'
             ]
-            
+
+            # Add WOH Flag if available
+            if 'WOH Flag' in filtered_df_sorted.columns:
+                base_columns.append('WOH Flag')
+
             # Check if any vape products are in the filtered data
             has_vape = 'Vape' in filtered_df_sorted['Flower Category'].values
-            
+
             if has_vape:
                 # Insert Vape Keywords column after Product Name
                 display_columns = base_columns[:1] + ['Vape Keywords'] + base_columns[1:]
             else:
                 display_columns = base_columns
-            
+
             display_df = filtered_df_sorted[display_columns].copy()
-            display_df = display_df.rename(columns={'In Stock Avg Units per Day': 'Daily Sales'})
-            
-            for col in ['Total Inventory', 'Distru Quantity', 'Daily Sales', 'WOH', 'Distru Days Supply']:
+            display_df = display_df.rename(columns={'In Stock Avg Units per Day': 'Daily Sales', 'WOH Flag': 'Flag'})
+
+            for col in ['Total Inventory', 'Distru Quantity', 'Distru Days Supply', 'Store Count']:
+                if col in display_df.columns:
+                    display_df[col] = display_df[col].astype(int)
+            for col in ['Daily Sales', 'WOH']:
                 if col in display_df.columns:
                     display_df[col] = display_df[col].round(1)
-            
-            st.dataframe(display_df, use_container_width=True, height=600)
+
+            if 'Flag' in display_df.columns:
+                st.dataframe(style_flag_dataframe(display_df), use_container_width=True, height=600, hide_index=True)
+            else:
+                st.dataframe(display_df, use_container_width=True, height=600)
     
     with tab3:
         st.header("📦 Products in Stock at Distru")
-        
+
+        # Coverage summary
+        total_combos = combined_df.groupby(['Brand', 'Weight', 'Flower Category']).size().reset_index()
+        distro_combos = combined_df[combined_df['Distru Quantity'] > 0].groupby(['Brand', 'Weight', 'Flower Category']).size().reset_index()
+        coverage_pct = (len(distro_combos) / len(total_combos) * 100) if len(total_combos) > 0 else 0
+        st.info(f"📊 Distro coverage: {len(distro_combos)} of {len(total_combos)} brand/weight/category combinations have stock ({coverage_pct:.0f}%)")
+
         distru_stock_df = combined_df[combined_df['Distru Quantity'] > 0].copy()
-        
+
         if distru_stock_df.empty:
             st.warning("⚠️ No products currently in stock at Distru")
         else:
@@ -1251,7 +1725,10 @@ if st.session_state.combined_data is not None:
             distru_display_df = distru_stock_sorted[display_columns].copy()
             distru_display_df = distru_display_df.rename(columns={'In Stock Avg Units per Day': 'Daily Sales'})
             
-            for col in ['Distru Quantity', 'Distru Days Supply', 'Total Inventory', 'Daily Sales', 'WOH']:
+            for col in ['Distru Quantity', 'Distru Days Supply', 'Total Inventory']:
+                if col in distru_display_df.columns:
+                    distru_display_df[col] = distru_display_df[col].astype(int)
+            for col in ['Daily Sales', 'WOH']:
                 if col in distru_display_df.columns:
                     distru_display_df[col] = distru_display_df[col].round(1)
             
@@ -1312,51 +1789,42 @@ if st.session_state.combined_data is not None:
 else:
     # Welcome screen
     if not headset_file and not distru_file:
-        st.info("👈 Upload the required CSV files in the sidebar to get started")
-        
+        st.info("👈 Upload CSV files in the sidebar to load new data, or check back after someone has uploaded this week's reports.")
+
         with st.expander("ℹ️ How it Works", expanded=True):
             st.markdown(f"""
-            **📊 Upload** → **🔄 Process** → **📈 Analyze** → **📋 Report**
-            
+            **📊 Upload** -> **🔄 Process** -> **💾 Save** -> **📈 Always Available**
+
             **Key Features:**
+            - 💾 **Persistent data:** Upload once, dashboard stays available for everyone until next upload
+            - 🚨 **Production alerts:** Automatic flags for low WOH (warning < {WOH_WARNING} wks, urgent < {WOH_URGENT} wks, critical < {WOH_CRITICAL} wks)
+            - 📦 **Distro gap detection:** Flags brand/weight/category combos with no distribution inventory
             - 🔗 Combines Headset and Distru inventory data
             - 🧮 Calculates Weeks on Hand (WOH) with outlier control (capped at {MAX_WOH_WEEKS:.0f} weeks)
             - 🌿 Tracks Flower (Indica/Sativa/Hybrid), Preroll, and Vape products
-            - 💨 **NEW:** Vape products broken down by keyword type (originals, dna, live resin, etc.)
-            - 📦 Tracks products in stock at distribution for production planning
-            - 🔤 Case-insensitive product and brand matching with normalization
+            - 💨 Vape products broken down by keyword type (originals, dna, live resin, etc.)
             - 📊 Interactive dashboards and filtering
             - 💾 CSV export functionality
-            - 🔍 Brand and store tracking verification
-            
+
             **Data Requirements:**
             - **Headset CSV:** Store Name, Product Name, Brand, Category, Total Quantity on Hand, In Stock Avg Units per Day
             - **Distru CSV:** Product (or Product Name), Active Quantity (skips first 2 metadata rows automatically)
-            
+
             **Tracked Brands:** {len(PRIVATE_LABEL_BRANDS)} private label brands (see sidebar)
-            
-            **Tracked Categories:** Flower (Indica, Sativa, Hybrid), Preroll, Vape
-            
-            **Vape Keywords Extracted:** originals, ascnd, dna, exotics, disposable, live resin, reload, rtu, curepen, curebar
-            
-            **Brand Normalization:** Automatically normalizes brand names to canonical form.
-            - "Pto" → "PTO"
-            - "mikrodose" → "MikroDose"
-            - "black label" → "Black Label"
-            
+
             **Version:** {st.session_state.app_version}
             """)
-    
+
     elif headset_file and distru_file:
         st.info("👈 Click the 'Process Data' button in the sidebar to analyze your files")
-    
+
     else:
         missing_files = []
         if not headset_file:
             missing_files.append("Headset Inventory Coverage")
         if not distru_file:
             missing_files.append("Distru Inventory Assets")
-        
+
         st.warning(f"📁 Please upload the {' and '.join(missing_files)} CSV file(s) to continue")
 
 # Footer
