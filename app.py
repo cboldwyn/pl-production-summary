@@ -63,10 +63,10 @@ DEFAULT_PRIVATE_LABEL_BRANDS = [
 # Product category keywords for filtering
 # This filters to include: Flower (Indica/Sativa/Hybrid), Preroll, and Vape
 # We use keywords because Flower categories appear as "Flower (Indica)" etc.
-PRODUCT_KEYWORDS = ['indica', 'sativa', 'hybrid', 'flower', 'preroll', 'vape']
+PRODUCT_KEYWORDS = ['indica', 'sativa', 'hybrid', 'flower', 'preroll', 'vape', 'extract']
 
 # Standard category order for consistent display
-CATEGORY_ORDER = ['Indica', 'Hybrid', 'Sativa', 'Preroll', 'Vape', 'Unknown']
+CATEGORY_ORDER = ['Indica', 'Hybrid', 'Sativa', 'Preroll', 'Vape', 'Extract', 'Unknown']
 
 # WOH calculation parameters
 MAX_WOH_WEEKS = 52.0  # Cap at 1 year for outlier control
@@ -281,11 +281,13 @@ def categorize_product_type(category: str) -> str:
         return 'Sativa'
     elif 'hybrid' in category:
         return 'Hybrid'
-    # Handle prerolls and vapes
+    # Handle prerolls, vapes, and extracts
     elif 'preroll' in category:
         return 'Preroll'
     elif 'vape' in category:
         return 'Vape'
+    elif 'extract' in category:
+        return 'Extract'
     # Unknown for anything else
     else:
         return 'Unknown'
