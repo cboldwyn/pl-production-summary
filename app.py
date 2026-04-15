@@ -587,6 +587,11 @@ def get_woh_alerts(df: pd.DataFrame) -> pd.DataFrame:
         'In Stock Avg Units per Day': 'Daily Sales'
     }, inplace=True)
 
+    # Round display values
+    for col in ['Daily Sales', 'WOH']:
+        if col in summary.columns:
+            summary[col] = summary[col].round(1)
+
     # Filter to flagged items only, sort by severity
     flag_order = {'critical': 0, 'urgent': 1, 'warning': 2}
     flagged = summary[summary['Flag'] != 'ok'].copy()
@@ -633,6 +638,11 @@ def get_distro_coverage_gaps(df: pd.DataFrame) -> pd.DataFrame:
         'In Stock Avg Units per Day': 'Daily Sales',
         'Product Name': 'Products'
     }, inplace=True)
+
+    # Round display values
+    for col in ['Daily Sales', 'WOH']:
+        if col in gaps.columns:
+            gaps[col] = gaps[col].round(1)
 
     gaps = gaps.drop(columns=['Distru Quantity'])
     gaps = gaps.sort_values('WOH')
@@ -1137,7 +1147,12 @@ def create_distru_stock_table(df: pd.DataFrame) -> pd.DataFrame:
         
         summary = summary.sort_values(['Brand', 'Weight'])
         summary = sort_by_category_order(summary, 'Flower Category')
-        
+
+        # Round display values
+        for col in ['In Stock Avg Units per Day', 'WOH']:
+            if col in summary.columns:
+                summary[col] = summary[col].round(1)
+
         return summary
         
     except Exception as e:
