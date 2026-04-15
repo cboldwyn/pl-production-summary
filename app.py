@@ -1,13 +1,14 @@
 """
-Private Label Production Summary
-================================
+Haven Current Inventory and Sales
+==================================
 
-A Streamlit application for automating weekly private label inventory reporting.
-Processes Headset inventory coverage and Distru inventory assets reports to calculate
-Weeks on Hand (WOH) and generate production insights for private label products.
+A Streamlit application for inventory analysis, production planning, and product
+performance tracking. Processes Headset inventory coverage and Distru inventory
+assets reports to calculate Weeks on Hand (WOH) and generate insights across
+private label and all product categories.
 
 Author: DC Retail
-Version: 3.0.0 - Persistent data + production flags
+Version: 4.0.0 - Dynamic brands list + all-products view
 Date: 2026
 
 Key Features:
@@ -20,6 +21,8 @@ Key Features:
 - Supports Flower (Indica/Sativa/Hybrid), Preroll, and Vape categories
 - Persistent data: auto-saves processed data, loads on startup
 - Production flags: WOH alerts (warning/urgent/critical) and distro coverage gaps
+- Dynamic private label brands list: uploadable via CSV, persisted to disk
+- All-products view: see non-private-label product data in Product Analysis
 """
 
 import streamlit as st
@@ -38,8 +41,8 @@ import plotly.graph_objects as go
 # CONSTANTS
 # =============================================================================
 
-# Private Label Brands - hardcoded list for consistency
-PRIVATE_LABEL_BRANDS = [
+# Default Private Label Brands - fallback when no uploaded list exists
+DEFAULT_PRIVATE_LABEL_BRANDS = [
     'Black Label',
     'Black Label Platinum',
     'Block Party',
@@ -77,20 +80,22 @@ WOH_CRITICAL = 2      # Danger flag
 # Persistence paths
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 LATEST_DATA_PATH = os.path.join(DATA_DIR, "latest_combined.parquet")
+ALL_PRODUCTS_PATH = os.path.join(DATA_DIR, "latest_all_products.parquet")
 METADATA_PATH = os.path.join(DATA_DIR, "metadata.json")
+BRANDS_PATH = os.path.join(DATA_DIR, "private_label_brands.json")
 
 # =============================================================================
 # PAGE CONFIGURATION
 # =============================================================================
 
 st.set_page_config(
-    page_title="Private Label Production Summary",
+    page_title="Haven Current Inventory and Sales",
     page_icon="📊",
     layout="wide"
 )
 
-st.title("📊 Private Label Production Summary")
-st.markdown("**DC Retail** | Weekly inventory analysis and production planning for private label products (Flower, Preroll, Vape)")
+st.title("📊 Haven Current Inventory and Sales")
+st.markdown("**DC Retail** | Inventory analysis, production planning, and product performance tracking (Flower, Preroll, Vape)")
 
 # =============================================================================
 # SESSION STATE MANAGEMENT
@@ -98,14 +103,14 @@ st.markdown("**DC Retail** | Weekly inventory analysis and production planning f
 
 def initialize_session_state():
     """Initialize session state variables for data persistence"""
-    session_vars = ['headset_data', 'distru_data', 'combined_data', 'processed_data', 'app_version', 'saved_metadata']
+    session_vars = ['headset_data', 'distru_data', 'combined_data', 'all_products_data', 'processed_data', 'app_version', 'saved_metadata', 'private_label_brands']
 
     for var in session_vars:
         if var not in st.session_state:
             st.session_state[var] = None
 
     if st.session_state.app_version is None:
-        st.session_state.app_version = "3.0.0"
+        st.session_state.app_version = "4.0.0"
 
 initialize_session_state()
 
@@ -216,34 +221,34 @@ def extract_vape_keywords(product_name: str) -> str:
     
     return ', '.join(found_keywords) if found_keywords else ""
 
-def normalize_brand_name(brand: str) -> str:
+def normalize_brand_name(brand: str, brands_list: List[str] = None) -> str:
     """
-    Normalize brand name to match canonical private label brand names.
-    
-    Performs case-insensitive matching against PRIVATE_LABEL_BRANDS list
+    Normalize brand name to match canonical brand names.
+
+    Performs case-insensitive matching against the provided brands list
     and returns the canonical name.
-    
+
     Args:
         brand: Brand name from data (e.g., "Pto", "mikrodose")
-        
+        brands_list: List of canonical brand names to match against.
+                     If None, loads from persistent storage.
+
     Returns:
         Canonical brand name (e.g., "PTO", "MikroDose") or original if no match
-        
-    Examples:
-        "Pto" → "PTO"
-        "mikrodose" → "MikroDose"
-        "black label" → "Black Label"
     """
     if pd.isna(brand):
         return brand
-    
+
+    if brands_list is None:
+        brands_list = load_brands_list()
+
     brand_lower = str(brand).lower().strip()
-    
+
     # Find matching canonical brand name (case-insensitive)
-    for canonical_brand in PRIVATE_LABEL_BRANDS:
+    for canonical_brand in brands_list:
         if canonical_brand.lower() == brand_lower:
             return canonical_brand
-    
+
     # If no match found, return original
     return str(brand).strip()
 
@@ -405,6 +410,101 @@ def load_saved_data() -> Tuple[Optional[pd.DataFrame], Optional[dict]]:
 
     except Exception:
         return None, None
+
+
+def load_saved_all_products() -> Optional[pd.DataFrame]:
+    """Load previously saved all-products DataFrame from disk."""
+    try:
+        if not os.path.exists(ALL_PRODUCTS_PATH):
+            return None
+        return pd.read_parquet(ALL_PRODUCTS_PATH)
+    except Exception:
+        return None
+
+
+def save_all_products_data(df: pd.DataFrame) -> bool:
+    """Save all-products DataFrame to disk for persistence."""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        save_df = df.copy()
+        for col in save_df.columns:
+            if hasattr(save_df[col], 'cat'):
+                save_df[col] = save_df[col].astype(str)
+        save_df.to_parquet(ALL_PRODUCTS_PATH, index=False)
+        return True
+    except Exception:
+        return False
+
+
+# =============================================================================
+# BRANDS LIST MANAGEMENT
+# =============================================================================
+
+def load_brands_list() -> List[str]:
+    """
+    Load the private label brands list from persistent storage.
+    Falls back to DEFAULT_PRIVATE_LABEL_BRANDS if no saved list exists.
+    """
+    try:
+        if os.path.exists(BRANDS_PATH):
+            with open(BRANDS_PATH, 'r') as f:
+                brands = json.load(f)
+            if isinstance(brands, list) and len(brands) > 0:
+                return brands
+    except Exception:
+        pass
+    return DEFAULT_PRIVATE_LABEL_BRANDS.copy()
+
+
+def save_brands_list(brands: List[str]) -> bool:
+    """Save brands list to persistent JSON storage."""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(BRANDS_PATH, 'w') as f:
+            json.dump(sorted(brands), f, indent=2)
+        return True
+    except Exception as e:
+        st.warning(f"Could not save brands list: {str(e)}")
+        return False
+
+
+def parse_brands_csv(uploaded_file) -> Optional[List[str]]:
+    """
+    Parse a Distru companies CSV export and extract private label brand names.
+
+    Expects columns: 'Name' and 'Private Label' (values: 'Yes'/'No').
+
+    Returns:
+        Sorted list of brand names where Private Label == 'Yes', or None on error.
+    """
+    try:
+        df = pd.read_csv(uploaded_file)
+
+        # Find required columns (case-insensitive)
+        name_col = None
+        pl_col = None
+        for col in df.columns:
+            if col.strip().lower() == 'name':
+                name_col = col
+            elif col.strip().lower() == 'private label':
+                pl_col = col
+
+        if name_col is None or pl_col is None:
+            st.error("CSV must contain 'Name' and 'Private Label' columns")
+            return None
+
+        # Filter to Private Label == Yes
+        pl_brands = df[df[pl_col].str.strip().str.lower() == 'yes'][name_col].dropna()
+        brands = sorted([str(b).strip() for b in pl_brands.tolist() if str(b).strip()])
+
+        if not brands:
+            st.warning("No brands with Private Label = 'Yes' found in CSV")
+            return None
+
+        return brands
+    except Exception as e:
+        st.error(f"Error parsing brands CSV: {str(e)}")
+        return None
 
 
 # =============================================================================
@@ -653,24 +753,18 @@ def load_distru_data(uploaded_file) -> Optional[pd.DataFrame]:
 # DATA PROCESSING FUNCTIONS
 # =============================================================================
 
-def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) -> Optional[pd.DataFrame]:
+def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame,
+                           brands_list: List[str] = None, filter_to_brands: bool = True) -> Optional[pd.DataFrame]:
     """
     Combine Headset and Distru data to calculate total inventory and WOH.
-    
-    Process:
-    1. Filter both datasets to private label brands and flower categories
-    2. Normalize product names for case-insensitive matching
-    3. Normalize brand names to canonical names
-    4. Aggregate Headset data across all stores
-    5. Aggregate Distru data
-    6. Add Distru-only products (not in stores)
-    7. Merge datasets and calculate metrics
-    8. Extract Vape keywords for Vape products
-    
+
     Args:
         headset_df: Headset inventory coverage report
         distru_df: Distru inventory assets report
-        
+        brands_list: Private label brands list. If None, loads from persistent storage.
+        filter_to_brands: If True, filter to brands_list only (PL view).
+                          If False, include all brands and add 'Private Label' column.
+
     Returns:
         Combined DataFrame with calculated metrics or None if processing fails
     """
@@ -679,24 +773,31 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
         # PROCESS HEADSET DATA
         # =====================================================================
         
+        # Resolve brands list
+        if brands_list is None:
+            brands_list = load_brands_list()
+        private_label_brands_normalized = [brand.lower().strip() for brand in brands_list]
+
         # Normalize brand names for case-insensitive matching
-        # Headset uses title case (Pto, Mikrodose), we need to match our list (PTO, MikroDose)
         headset_df_normalized = headset_df.copy()
         headset_df_normalized['Brand Normalized'] = headset_df_normalized['Brand'].str.lower().str.strip()
-        
-        # Create normalized private label brands list for matching
-        private_label_brands_normalized = [brand.lower().strip() for brand in PRIVATE_LABEL_BRANDS]
-        
-        # Filter to private label brands using normalized names
-        headset_filtered = headset_df_normalized[
-            headset_df_normalized['Brand Normalized'].isin(private_label_brands_normalized)
-        ].copy()
-        
+
+        if filter_to_brands:
+            # Filter to private label brands using normalized names
+            headset_filtered = headset_df_normalized[
+                headset_df_normalized['Brand Normalized'].isin(private_label_brands_normalized)
+            ].copy()
+        else:
+            # Include all brands
+            headset_filtered = headset_df_normalized.copy()
+
         # Normalize brand names to canonical names (fixes "Pto" → "PTO")
-        headset_filtered['Brand'] = headset_filtered['Brand'].apply(normalize_brand_name)
-        
+        headset_filtered['Brand'] = headset_filtered['Brand'].apply(
+            lambda b: normalize_brand_name(b, brands_list)
+        )
+
         if headset_filtered.empty:
-            st.warning("⚠️ No private label products found in Headset data")
+            st.warning("⚠️ No products found in Headset data")
             return None
         
         # Filter to tracked product categories
@@ -709,7 +810,7 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
         post_category_filter = len(headset_filtered)
         
         if headset_filtered.empty:
-            st.warning("⚠️ No private label tracked products found in Headset data")
+            st.warning("⚠️ No tracked products found in Headset data (Flower, Preroll, Vape)")
             return None
         
         # Extract product weights and standardize categories
@@ -746,7 +847,7 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
         headset_summary = headset_summary[headset_summary['Total Quantity on Hand'] > 0].copy()
         
         if headset_summary.empty:
-            st.warning("⚠️ No private label tracked products with inventory found")
+            st.warning("⚠️ No tracked products with inventory found")
             return None
         
         # =====================================================================
@@ -765,14 +866,17 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
         
         # Normalize brand names for case-insensitive matching
         distru_filtered['Brand Normalized'] = distru_filtered['Brand'].str.lower().str.strip()
-        
-        # Filter to private label brands using normalized names
-        distru_filtered = distru_filtered[
-            distru_filtered['Brand Normalized'].isin(private_label_brands_normalized)
-        ].copy()
-        
+
+        if filter_to_brands:
+            # Filter to private label brands using normalized names
+            distru_filtered = distru_filtered[
+                distru_filtered['Brand Normalized'].isin(private_label_brands_normalized)
+            ].copy()
+
         # Normalize brand names to canonical names (fixes "Pto" → "PTO")
-        distru_filtered['Brand'] = distru_filtered['Brand'].apply(normalize_brand_name)
+        distru_filtered['Brand'] = distru_filtered['Brand'].apply(
+            lambda b: normalize_brand_name(b, brands_list)
+        )
         
         # Filter to tracked product categories
         if 'Category' in distru_filtered.columns:
@@ -884,9 +988,15 @@ def combine_inventory_data(headset_df: pd.DataFrame, distru_df: pd.DataFrame) ->
         # Create Product Group for categorization
         combined['Product Group'] = combined['Brand'] + ' ' + combined['Weight']
         
+        # Tag private label products when processing all brands
+        if not filter_to_brands:
+            combined['Private Label'] = combined['Brand'].str.lower().str.strip().isin(
+                private_label_brands_normalized
+            )
+
         # Drop normalized column - no longer needed
         combined = combined.drop(columns=['Product Name Normalized'])
-        
+
         return combined
         
     except Exception as e:
@@ -1198,6 +1308,13 @@ if st.session_state.combined_data is None:
         st.session_state.combined_data = saved_df
         st.session_state.saved_metadata = saved_meta
 
+if st.session_state.all_products_data is None:
+    all_products_df = load_saved_all_products()
+    if all_products_df is not None:
+        if 'WOH Flag' not in all_products_df.columns:
+            all_products_df = calculate_production_flags(all_products_df)
+        st.session_state.all_products_data = all_products_df
+
 # =============================================================================
 # STREAMLIT UI
 # =============================================================================
@@ -1217,12 +1334,33 @@ distru_file = st.sidebar.file_uploader(
     help="Upload the inventory assets report from Distru"
 )
 
-# Display private label brands
+# Private Label Brands Management
 st.sidebar.markdown("---")
 st.sidebar.subheader("🏷️ Private Label Brands")
-st.sidebar.caption(f"Tracking {len(PRIVATE_LABEL_BRANDS)} brands:")
+
+# Load current brands list into session state if not already loaded
+if st.session_state.private_label_brands is None:
+    st.session_state.private_label_brands = load_brands_list()
+
+current_brands = st.session_state.private_label_brands
+
+# Upload brands CSV
+brands_csv = st.sidebar.file_uploader(
+    "Update Brands List (Distru CSV)", type=['csv'], key="brands_upload",
+    help="Upload a Distru companies export CSV to update the private label brands list"
+)
+
+if brands_csv is not None:
+    parsed_brands = parse_brands_csv(brands_csv)
+    if parsed_brands is not None:
+        if save_brands_list(parsed_brands):
+            st.session_state.private_label_brands = parsed_brands
+            current_brands = parsed_brands
+            st.sidebar.success(f"Updated to {len(parsed_brands)} brands")
+
+st.sidebar.caption(f"Tracking {len(current_brands)} brands:")
 with st.sidebar.expander("View Brands"):
-    for brand in PRIVATE_LABEL_BRANDS:
+    for brand in current_brands:
         st.markdown(f"• {brand}")
 
 # Process Data Button
@@ -1240,8 +1378,11 @@ if st.sidebar.button("🚀 Process Data", type="primary", disabled=not (headset_
         st.session_state.headset_data = headset_df
         st.session_state.distru_data = distru_df
         
-        # Combine and process data
-        combined_data = combine_inventory_data(headset_df, distru_df)
+        # Load current brands list
+        brands_list = load_brands_list()
+
+        # Combine and process data (private label only)
+        combined_data = combine_inventory_data(headset_df, distru_df, brands_list=brands_list, filter_to_brands=True)
 
         if combined_data is not None:
             combined_data = calculate_production_flags(combined_data)
@@ -1265,13 +1406,20 @@ if st.sidebar.button("🚀 Process Data", type="primary", disabled=not (headset_
                     'product_count': len(combined_data)
                 }
 
-            st.success(f"✅ Processed {len(combined_data):,} products. Data saved.")
+            # Also process all products (for Product Analysis non-PL view)
+            all_products = combine_inventory_data(headset_df, distru_df, brands_list=brands_list, filter_to_brands=False)
+            if all_products is not None:
+                all_products = calculate_production_flags(all_products)
+                st.session_state.all_products_data = all_products
+                save_all_products_data(all_products)
+
+            st.success(f"✅ Processed {len(combined_data):,} private label products ({len(all_products) if all_products is not None else 0:,} total). Data saved.")
 
 # Sidebar - Version Info
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 📋 App Info")
 st.sidebar.markdown(f"**Version:** {st.session_state.app_version}")
-st.sidebar.markdown("**Last Updated:** March 2026")
+st.sidebar.markdown("**Last Updated:** April 2026")
 
 # Main Content Area
 if st.session_state.combined_data is not None:
@@ -1298,13 +1446,13 @@ if st.session_state.combined_data is not None:
             pass
 
     # Create tabs
-    tab0, tab1, tab2, tab3, tab4 = st.tabs(["🚨 Alerts", "📊 Dashboard", "🎯 Product Analysis", "📦 Distru Stock", "📋 Raw Data"])
+    tab0, tab1, tab2, tab3, tab4 = st.tabs(["🚨 Private Label Production Alerts", "📊 Private Label Performance & Stock Dashboard", "🎯 Product Analysis", "📦 Distru Stock", "📋 Raw Data"])
 
     # =========================================================================
     # ALERTS TAB
     # =========================================================================
     with tab0:
-        st.header("🚨 Production Alerts")
+        st.header("🚨 Private Label Production Alerts")
 
         # Build combined alerts report
         woh_alerts = get_woh_alerts(combined_df)
@@ -1484,7 +1632,7 @@ if st.session_state.combined_data is not None:
     # DASHBOARD TAB
     # =========================================================================
     with tab1:
-        st.header("📊 Private Label Inventory Dashboard")
+        st.header("📊 Private Label Performance & Stock Dashboard")
 
         # Key metrics
         col1, col2, col3, col4, col5 = st.columns(5)
@@ -1578,97 +1726,127 @@ if st.session_state.combined_data is not None:
     
     with tab2:
         st.header("🎯 Product Analysis")
-        
-        # Filters
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            selected_brands = st.multiselect(
-                "Select Brands",
-                options=sorted(combined_df['Brand'].unique()),
-                default=sorted(combined_df['Brand'].unique())
-            )
-        
-        with col2:
-            selected_categories = st.multiselect(
-                "Select Categories",
-                options=sorted(combined_df['Flower Category'].unique()),
-                default=sorted(combined_df['Flower Category'].unique())
-            )
-        
-        with col3:
-            selected_weights = st.multiselect(
-                "Select Weights",
-                options=sorted(combined_df['Weight'].unique()),
-                default=sorted(combined_df['Weight'].unique())
-            )
-        
-        # Apply filters
-        filtered_df = combined_df[
-            (combined_df['Brand'].isin(selected_brands)) &
-            (combined_df['Flower Category'].isin(selected_categories)) &
-            (combined_df['Weight'].isin(selected_weights))
-        ]
-        
-        if filtered_df.empty:
-            st.warning("⚠️ No products match the selected filters")
+
+        # View mode selector
+        view_mode = st.radio(
+            "Product View",
+            ["Private Label", "All Products", "Non-Private Label"],
+            horizontal=True
+        )
+
+        # Select data source based on view mode
+        if view_mode == "Private Label":
+            analysis_df = combined_df
         else:
-            # Sort options
-            sort_by = st.selectbox(
-                "Sort by",
-                options=['WOH', 'Total Inventory', 'Distru Quantity', 'Daily Sales', 'Product Name'],
-                index=0
-            )
-            
-            sort_ascending = st.checkbox("Sort ascending", value=False)
-            
-            # Map display name to column name
-            sort_column_map = {
-                'Daily Sales': 'In Stock Avg Units per Day',
-                'WOH': 'WOH',
-                'Total Inventory': 'Total Inventory',
-                'Distru Quantity': 'Distru Quantity',
-                'Product Name': 'Product Name'
-            }
-            
-            filtered_df_sorted = filtered_df.sort_values(sort_column_map[sort_by], ascending=sort_ascending)
-            
-            st.subheader(f"📋 Product Details ({len(filtered_df_sorted)} products)")
-            
-            # Determine columns to display - include Vape Keywords for Vape products and WOH Flag
-            base_columns = [
-                'Product Name', 'Brand', 'Flower Category', 'Weight',
-                'Total Inventory', 'Distru Quantity', 'In Stock Avg Units per Day',
-                'WOH', 'Distru Days Supply', 'Store Count'
+            all_products = st.session_state.all_products_data
+            if all_products is None:
+                st.info("Upload and process new data to view non-private-label products.")
+                analysis_df = None
+            elif view_mode == "Non-Private Label":
+                analysis_df = all_products[all_products['Private Label'] == False].copy()
+            else:
+                analysis_df = all_products
+
+        if analysis_df is not None and not analysis_df.empty:
+            # Filters
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                selected_brands = st.multiselect(
+                    "Select Brands",
+                    options=sorted(analysis_df['Brand'].unique()),
+                    default=sorted(analysis_df['Brand'].unique()),
+                    key=f"brands_{view_mode}"
+                )
+
+            with col2:
+                selected_categories = st.multiselect(
+                    "Select Categories",
+                    options=sorted(analysis_df['Flower Category'].unique()),
+                    default=sorted(analysis_df['Flower Category'].unique()),
+                    key=f"categories_{view_mode}"
+                )
+
+            with col3:
+                selected_weights = st.multiselect(
+                    "Select Weights",
+                    options=sorted(analysis_df['Weight'].unique()),
+                    default=sorted(analysis_df['Weight'].unique()),
+                    key=f"weights_{view_mode}"
+                )
+
+            # Apply filters
+            filtered_df = analysis_df[
+                (analysis_df['Brand'].isin(selected_brands)) &
+                (analysis_df['Flower Category'].isin(selected_categories)) &
+                (analysis_df['Weight'].isin(selected_weights))
             ]
 
-            # Add WOH Flag if available
-            if 'WOH Flag' in filtered_df_sorted.columns:
-                base_columns.append('WOH Flag')
-
-            # Check if any vape products are in the filtered data
-            has_vape = 'Vape' in filtered_df_sorted['Flower Category'].values
-
-            if has_vape:
-                # Insert Vape Keywords column after Product Name
-                display_columns = base_columns[:1] + ['Vape Keywords'] + base_columns[1:]
+            if filtered_df.empty:
+                st.warning("⚠️ No products match the selected filters")
             else:
-                display_columns = base_columns
+                # Sort options
+                sort_by = st.selectbox(
+                    "Sort by",
+                    options=['WOH', 'Total Inventory', 'Distru Quantity', 'Daily Sales', 'Product Name'],
+                    index=0,
+                    key=f"sort_{view_mode}"
+                )
 
-            display_df = filtered_df_sorted[display_columns].copy()
-            display_df = display_df.rename(columns={'In Stock Avg Units per Day': 'Daily Sales', 'WOH Flag': 'Flag'})
+                sort_ascending = st.checkbox("Sort ascending", value=False, key=f"asc_{view_mode}")
 
-            for col in ['Total Inventory', 'Distru Quantity', 'Distru Days Supply', 'Store Count']:
-                if col in display_df.columns:
-                    display_df[col] = display_df[col].astype(int)
-            for col in ['Daily Sales', 'WOH']:
-                if col in display_df.columns:
-                    display_df[col] = display_df[col].round(1)
+                # Map display name to column name
+                sort_column_map = {
+                    'Daily Sales': 'In Stock Avg Units per Day',
+                    'WOH': 'WOH',
+                    'Total Inventory': 'Total Inventory',
+                    'Distru Quantity': 'Distru Quantity',
+                    'Product Name': 'Product Name'
+                }
 
-            if 'Flag' in display_df.columns:
-                st.dataframe(style_flag_dataframe(display_df), use_container_width=True, height=600, hide_index=True)
-            else:
-                st.dataframe(display_df, use_container_width=True, height=600)
+                filtered_df_sorted = filtered_df.sort_values(sort_column_map[sort_by], ascending=sort_ascending)
+
+                st.subheader(f"📋 Product Details ({len(filtered_df_sorted)} products)")
+
+                # Determine columns to display - include Vape Keywords for Vape products and WOH Flag
+                base_columns = [
+                    'Product Name', 'Brand', 'Flower Category', 'Weight',
+                    'Total Inventory', 'Distru Quantity', 'In Stock Avg Units per Day',
+                    'WOH', 'Distru Days Supply', 'Store Count'
+                ]
+
+                # Add WOH Flag if available
+                if 'WOH Flag' in filtered_df_sorted.columns:
+                    base_columns.append('WOH Flag')
+
+                # Check if any vape products are in the filtered data
+                has_vape = 'Vape' in filtered_df_sorted['Flower Category'].values
+
+                if has_vape and 'Vape Keywords' in filtered_df_sorted.columns:
+                    # Insert Vape Keywords column after Product Name
+                    display_columns = base_columns[:1] + ['Vape Keywords'] + base_columns[1:]
+                else:
+                    display_columns = base_columns
+
+                # Only include columns that exist in the dataframe
+                display_columns = [c for c in display_columns if c in filtered_df_sorted.columns]
+
+                display_df = filtered_df_sorted[display_columns].copy()
+                display_df = display_df.rename(columns={'In Stock Avg Units per Day': 'Daily Sales', 'WOH Flag': 'Flag'})
+
+                for col in ['Total Inventory', 'Distru Quantity', 'Distru Days Supply', 'Store Count']:
+                    if col in display_df.columns:
+                        display_df[col] = display_df[col].astype(int)
+                for col in ['Daily Sales', 'WOH']:
+                    if col in display_df.columns:
+                        display_df[col] = display_df[col].round(1)
+
+                if 'Flag' in display_df.columns:
+                    st.dataframe(style_flag_dataframe(display_df), use_container_width=True, height=600, hide_index=True)
+                else:
+                    st.dataframe(display_df, use_container_width=True, height=600)
+        elif analysis_df is not None and analysis_df.empty:
+            st.warning("⚠️ No products found for the selected view")
     
     with tab3:
         st.header("📦 Products in Stock at Distru")
@@ -1810,7 +1988,7 @@ else:
             - **Headset CSV:** Store Name, Product Name, Brand, Category, Total Quantity on Hand, In Stock Avg Units per Day
             - **Distru CSV:** Product (or Product Name), Active Quantity (skips first 2 metadata rows automatically)
 
-            **Tracked Brands:** {len(PRIVATE_LABEL_BRANDS)} private label brands (see sidebar)
+            **Tracked Brands:** {len(load_brands_list())} private label brands (see sidebar)
 
             **Version:** {st.session_state.app_version}
             """)
@@ -1829,4 +2007,4 @@ else:
 
 # Footer
 st.markdown("---")
-st.markdown(f"**Private Label Production Summary v{st.session_state.app_version}** | Built for DC Retail | Tracks {len(PRIVATE_LABEL_BRANDS)} Private Label Brands")
+st.markdown(f"**Haven Current Inventory and Sales v{st.session_state.app_version}** | Built for DC Retail | Tracks {len(load_brands_list())} Private Label Brands")
