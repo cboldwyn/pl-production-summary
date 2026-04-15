@@ -679,7 +679,27 @@ def style_flag_dataframe(df: pd.DataFrame, flag_column: str = 'Flag'):
         style = flag_colors.get(flag, '')
         return [style] * len(row)
 
-    return df.style.apply(apply_row_style, axis=1)
+    # Build format dict for float columns that should display as 1 decimal
+    format_dict = {}
+    for col in df.columns:
+        if col in ('Daily Sales', 'WOH', 'In Stock Avg Units per Day'):
+            format_dict[col] = '{:.1f}'
+
+    styled = df.style.apply(apply_row_style, axis=1)
+    if format_dict:
+        styled = styled.format(format_dict)
+    return styled
+
+
+def format_dataframe(df: pd.DataFrame):
+    """Apply consistent number formatting (1 decimal) to Daily Sales and WOH columns."""
+    format_dict = {}
+    for col in df.columns:
+        if col in ('Daily Sales', 'WOH', 'In Stock Avg Units per Day'):
+            format_dict[col] = '{:.1f}'
+    if format_dict:
+        return df.style.format(format_dict)
+    return df
 
 
 # =============================================================================
@@ -1241,7 +1261,7 @@ def create_expandable_product_summary(df: pd.DataFrame):
                     category_summary[col] = category_summary[col].round(1)
             
             st.markdown("**📊 By Category:**")
-            st.dataframe(category_summary, use_container_width=True, hide_index=True)
+            st.dataframe(format_dataframe(category_summary), use_container_width=True, hide_index=True)
             
             # Individual products by category
             st.markdown("**🌿 Individual Products:**")
@@ -1293,24 +1313,24 @@ def create_expandable_product_summary(df: pd.DataFrame):
                                 for col in ['Daily Sales', 'WOH']:
                                     if col in display_df.columns:
                                         display_df[col] = display_df[col].round(1)
-                                
-                                st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+                                st.dataframe(format_dataframe(display_df), use_container_width=True, hide_index=True)
                     else:
                         # Non-Vape categories - display normally
                         with st.expander(f"    {category} ({total_count} products, {distro_count} at Distro)"):
                             display_columns = [
-                                'Product Name', 'Total Inventory', 'Distru Quantity', 
+                                'Product Name', 'Total Inventory', 'Distru Quantity',
                                 'In Stock Avg Units per Day', 'WOH', 'Store Count'
                             ]
-                            
+
                             display_df = category_products[display_columns].copy()
                             display_df = display_df.rename(columns={'In Stock Avg Units per Day': 'Daily Sales'})
-                            
+
                             for col in ['Total Inventory', 'Distru Quantity', 'Daily Sales', 'WOH']:
                                 if col in display_df.columns:
                                     display_df[col] = display_df[col].round(1)
-                            
-                            st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+                            st.dataframe(format_dataframe(display_df), use_container_width=True, hide_index=True)
 
 # =============================================================================
 # AUTO-LOAD SAVED DATA
@@ -1861,7 +1881,7 @@ if st.session_state.combined_data is not None:
                 if 'Flag' in display_df.columns:
                     st.dataframe(style_flag_dataframe(display_df), use_container_width=True, height=600, hide_index=True)
                 else:
-                    st.dataframe(display_df, use_container_width=True, height=600)
+                    st.dataframe(format_dataframe(display_df), use_container_width=True, height=600)
         elif analysis_df is not None and analysis_df.empty:
             st.warning("⚠️ No products found for the selected view")
     
@@ -1887,7 +1907,7 @@ if st.session_state.combined_data is not None:
             if not distru_summary.empty:
                 st.subheader("📊 Distru Stock Summary")
                 distru_summary_display = distru_summary.rename(columns={'In Stock Avg Units per Day': 'Daily Sales'})
-                st.dataframe(distru_summary_display, use_container_width=True)
+                st.dataframe(format_dataframe(distru_summary_display), use_container_width=True)
             
             # Detailed product list
             st.subheader("📋 Detailed Product List")
@@ -1927,7 +1947,7 @@ if st.session_state.combined_data is not None:
                 if col in distru_display_df.columns:
                     distru_display_df[col] = distru_display_df[col].round(1)
             
-            st.dataframe(distru_display_df, use_container_width=True, height=600)
+            st.dataframe(format_dataframe(distru_display_df), use_container_width=True, height=600)
     
     with tab4:
         st.header("📋 Raw Data")
@@ -1979,7 +1999,7 @@ if st.session_state.combined_data is not None:
         else:
             display_raw_df = combined_df
         
-        st.dataframe(display_raw_df, use_container_width=True, height=600)
+        st.dataframe(format_dataframe(display_raw_df), use_container_width=True, height=600)
 
 else:
     # Welcome screen
