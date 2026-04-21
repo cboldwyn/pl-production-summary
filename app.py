@@ -83,6 +83,8 @@ LATEST_DATA_PATH = os.path.join(DATA_DIR, "latest_combined.parquet")
 ALL_PRODUCTS_PATH = os.path.join(DATA_DIR, "latest_all_products.parquet")
 METADATA_PATH = os.path.join(DATA_DIR, "metadata.json")
 BRANDS_PATH = os.path.join(DATA_DIR, "private_label_brands.json")
+BL_INPUTS_PATH = os.path.join(DATA_DIR, "latest_bl_inputs.parquet")
+BL_INPUTS_META_PATH = os.path.join(DATA_DIR, "bl_inputs_metadata.json")
 
 # =============================================================================
 # PAGE CONFIGURATION
@@ -103,7 +105,7 @@ st.markdown("**DC Retail** | Inventory analysis, production planning, and produc
 
 def initialize_session_state():
     """Initialize session state variables for data persistence"""
-    session_vars = ['headset_data', 'distru_data', 'combined_data', 'all_products_data', 'processed_data', 'app_version', 'saved_metadata', 'private_label_brands']
+    session_vars = ['headset_data', 'distru_data', 'combined_data', 'all_products_data', 'processed_data', 'app_version', 'saved_metadata', 'private_label_brands', 'bl_inputs_data', 'bl_inputs_metadata']
 
     for var in session_vars:
         if var not in st.session_state:
@@ -781,6 +783,136 @@ def load_distru_data(uploaded_file) -> Optional[pd.DataFrame]:
         st.error(f"❌ Error loading Distru data: {str(e)}")
         return None
 
+
+def load_bl_input_materials(uploaded_file) -> Optional[pd.DataFrame]:
+    """
+    Load and filter a Beyond Legends Distru Inventory Assets export down to
+    non-cannabis input materials (Packaging + Supplies), then aggregate by SKU
+    so each product shows a single total-on-hand row.
+
+    Distru emits one row per License (e.g. Manufacturing vs Distribution).
+    Jackie needs total on-hand per SKU for reorder decisions, so we sum
+    quantity and cost across licenses and join Location + License into
+    comma-delimited strings. Raw per-license rows are not preserved here;
+    they remain available by re-exporting from Distru if needed.
+
+    Args:
+        uploaded_file: Uploaded CSV from the Distru Inventory Assets report
+
+    Returns:
+        Aggregated DataFrame of input materials, or None on failure.
+    """
+    try:
+        df = pd.read_csv(uploaded_file, skiprows=2, dtype=str)
+
+        if df.empty:
+            st.error("❌ Beyond Legends file appears to be empty after skipping metadata rows")
+            return None
+
+        required = [
+            'Product', 'License', 'Location', 'Vendor', 'Unit Type',
+            'Active Quantity', 'Category', 'Subcategory',
+            'Unit Cost (Actual)', 'Total Cost (Actual)', 'Expiration Date'
+        ]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            st.error(f"❌ Beyond Legends file missing required columns: {', '.join(missing)}")
+            return None
+
+        if 'SKU' not in df.columns:
+            df['SKU'] = ''
+
+        # Numeric + date coercion
+        for col in ['Active Quantity', 'Unit Cost (Actual)', 'Total Cost (Actual)']:
+            df[col] = df[col].apply(lambda x: safe_numeric(x, 0))
+        df['Expiration Date'] = pd.to_datetime(df['Expiration Date'], errors='coerce')
+
+        # Filter to input materials only
+        df = df[df['Category'].isin(['Packaging', 'Supplies'])].copy()
+        if df.empty:
+            st.warning("⚠️ No Packaging or Supplies rows found in this export.")
+            return df
+
+        # Clean empty strings for filter / display
+        for col in ['Subcategory', 'Vendor', 'Location', 'Unit Type']:
+            df[col] = df[col].fillna('').astype(str).str.strip()
+            df.loc[df[col] == '', col] = '—'
+
+        # Normalize SKU for grouping: fall back to Product when SKU is blank
+        df['SKU'] = df['SKU'].fillna('').astype(str).str.strip()
+        df['_group_key'] = df['SKU'].where(df['SKU'] != '', df['Product'])
+
+        def _first_non_empty(series):
+            for v in series:
+                if pd.notna(v) and str(v).strip() != '':
+                    return v
+            return ''
+
+        def _join_unique(series):
+            vals = sorted({str(v).strip() for v in series if pd.notna(v) and str(v).strip() not in ('', '—')})
+            return ', '.join(vals) if vals else '—'
+
+        grouped = df.groupby('_group_key', as_index=False).agg(
+            Product=('Product', _first_non_empty),
+            SKU=('SKU', _first_non_empty),
+            Vendor=('Vendor', _first_non_empty),
+            Category=('Category', _first_non_empty),
+            Subcategory=('Subcategory', _first_non_empty),
+            **{'Unit Type': ('Unit Type', _first_non_empty)},
+            **{'Unit Cost (Actual)': ('Unit Cost (Actual)', _first_non_empty)},
+            **{'Active Quantity': ('Active Quantity', 'sum')},
+            **{'Total Cost (Actual)': ('Total Cost (Actual)', 'sum')},
+            Locations=('Location', _join_unique),
+            Licenses=('License', _join_unique),
+            **{'Earliest Expiration': ('Expiration Date', 'min')},
+        )
+
+        grouped = grouped.drop(columns=['_group_key'], errors='ignore')
+        return grouped
+
+    except Exception as e:
+        st.error(f"❌ Error loading Beyond Legends data: {str(e)}")
+        return None
+
+
+def save_bl_inputs_data(df: pd.DataFrame, source_filename: str) -> bool:
+    """Persist BL input materials to Parquet + a small metadata JSON."""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        save_df = df.copy()
+        for col in save_df.columns:
+            if hasattr(save_df[col], 'cat'):
+                save_df[col] = save_df[col].astype(str)
+        save_df.to_parquet(BL_INPUTS_PATH, index=False)
+
+        meta = {
+            'last_updated': datetime.now().isoformat(),
+            'source_file': source_filename,
+            'sku_count': int(len(df)),
+            'total_value': float(df['Total Cost (Actual)'].sum()) if 'Total Cost (Actual)' in df.columns else 0.0,
+        }
+        with open(BL_INPUTS_META_PATH, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return True
+    except Exception as e:
+        st.warning(f"Could not save Beyond Legends input materials to disk: {str(e)}")
+        return False
+
+
+def load_saved_bl_inputs() -> Tuple[Optional[pd.DataFrame], Optional[dict]]:
+    """Load persisted BL input materials + metadata, if present."""
+    try:
+        if not os.path.exists(BL_INPUTS_PATH):
+            return None, None
+        df = pd.read_parquet(BL_INPUTS_PATH)
+        meta = None
+        if os.path.exists(BL_INPUTS_META_PATH):
+            with open(BL_INPUTS_META_PATH, 'r') as f:
+                meta = json.load(f)
+        return df, meta
+    except Exception:
+        return None, None
+
 # =============================================================================
 # DATA PROCESSING FUNCTIONS
 # =============================================================================
@@ -1179,6 +1311,146 @@ def create_distru_stock_table(df: pd.DataFrame) -> pd.DataFrame:
         st.error(f"Error creating Distru stock table: {str(e)}")
         return pd.DataFrame()
 
+
+def render_bl_inputs_tab(df: Optional[pd.DataFrame], meta: Optional[dict] = None):
+    """
+    Render the Beyond Legends Input Materials tab.
+
+    v1 shows an aggregated SKU-level view of non-cannabis input materials
+    (Packaging + Supplies) with filters and CSV download. No weeks-on-hand or
+    reorder points in v1 (no consumption data available yet).
+    """
+    st.header("🧰 Input Materials, Beyond Legends")
+
+    if df is None or df.empty:
+        st.info("👈 Upload the Beyond Legends Distru Inventory Assets CSV in the sidebar to populate this tab.")
+        return
+
+    # Freshness caption
+    if meta:
+        try:
+            last_updated = datetime.fromisoformat(meta['last_updated'])
+            age_days = (datetime.now() - last_updated).days
+            if age_days < 1:
+                freshness = "Today"
+            elif age_days < 2:
+                freshness = "Yesterday"
+            else:
+                freshness = f"{age_days} days old"
+            st.caption(
+                f"Data from: {last_updated.strftime('%A %m/%d/%Y %I:%M %p')} ({freshness}) | "
+                f"Source: {meta.get('source_file', 'N/A')}"
+            )
+        except (KeyError, ValueError):
+            pass
+
+    # Summary KPIs
+    total_value = float(df['Total Cost (Actual)'].sum()) if 'Total Cost (Actual)' in df.columns else 0.0
+    zero_low = int((df['Active Quantity'] <= 0).sum()) if 'Active Quantity' in df.columns else 0
+    top_vendors = (
+        df['Vendor'].value_counts().head(3)
+        if 'Vendor' in df.columns else pd.Series(dtype=int)
+    )
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("SKUs", f"{len(df):,}")
+    col2.metric("Inventory Value", f"${total_value:,.0f}")
+    with col3:
+        st.metric("Zero/Low Stock", f"{zero_low:,}")
+    with col4:
+        st.markdown("**Top Vendors**")
+        if not top_vendors.empty:
+            lines = [f"• {v} ({int(c)})" for v, c in top_vendors.items()]
+            st.markdown("<br/>".join(lines), unsafe_allow_html=True)
+        else:
+            st.markdown("—")
+
+    st.markdown("---")
+
+    # Filters
+    filter_cols = st.columns(4)
+
+    with filter_cols[0]:
+        vendor_options = sorted(df['Vendor'].dropna().unique().tolist())
+        selected_vendors = st.multiselect(
+            "Vendor", vendor_options, default=vendor_options, key="bl_vendor"
+        )
+
+    with filter_cols[1]:
+        subcat_options = sorted(df['Subcategory'].dropna().unique().tolist())
+        selected_subcats = st.multiselect(
+            "Subcategory", subcat_options, default=subcat_options, key="bl_subcat"
+        )
+
+    # Locations are comma-joined in aggregation; split for the filter list
+    all_locs = set()
+    for s in df['Locations'].dropna():
+        for loc in str(s).split(','):
+            loc = loc.strip()
+            if loc:
+                all_locs.add(loc)
+    loc_options = sorted(all_locs)
+
+    with filter_cols[2]:
+        selected_locs = st.multiselect(
+            "Location", loc_options, default=loc_options, key="bl_loc"
+        )
+
+    with filter_cols[3]:
+        search_term = st.text_input("Search product name", key="bl_search")
+
+    # Apply filters
+    filtered = df.copy()
+    if selected_vendors:
+        filtered = filtered[filtered['Vendor'].isin(selected_vendors)]
+    if selected_subcats:
+        filtered = filtered[filtered['Subcategory'].isin(selected_subcats)]
+    if selected_locs and selected_locs != loc_options:
+        loc_pattern = '|'.join(pd.Series(selected_locs).map(lambda s: s.replace('.', r'\.')))
+        filtered = filtered[filtered['Locations'].str.contains(loc_pattern, na=False, regex=True)]
+    if search_term:
+        filtered = filtered[filtered['Product'].str.contains(search_term, case=False, na=False)]
+
+    # Build display table
+    display_cols = [
+        'Product', 'Subcategory', 'Vendor', 'Locations',
+        'Active Quantity', 'Unit Type', 'Unit Cost (Actual)', 'Total Cost (Actual)'
+    ]
+    # Conditionally append expiration column
+    has_expiry = 'Earliest Expiration' in filtered.columns and filtered['Earliest Expiration'].notna().any()
+    if has_expiry:
+        display_cols.append('Earliest Expiration')
+
+    display_df = filtered[display_cols].copy()
+    display_df = display_df.sort_values('Total Cost (Actual)', ascending=False)
+
+    # Tidy numeric formatting. Show Active Quantity as integer when all values are whole.
+    if not display_df.empty:
+        qty = display_df['Active Quantity']
+        if ((qty.fillna(0) % 1) == 0).all():
+            display_df['Active Quantity'] = qty.fillna(0).astype(int)
+
+    zero_cost_ct = int((filtered['Total Cost (Actual)'] <= 0).sum()) if 'Total Cost (Actual)' in filtered.columns else 0
+    st.caption(
+        f"{len(filtered):,} of {len(df):,} SKUs shown. "
+        f"{zero_cost_ct} rows have $0 cost (often service or test items, left in view)."
+    )
+
+    st.dataframe(format_dataframe(display_df), use_container_width=True, hide_index=True, height=600)
+
+    # Download button
+    timestamp = datetime.now().strftime('%Y%m%d')
+    csv_buffer = io.StringIO()
+    display_df.to_csv(csv_buffer, index=False)
+    st.download_button(
+        label="⬇️ Download filtered CSV",
+        data=csv_buffer.getvalue(),
+        file_name=f"bl_input_materials_{timestamp}.csv",
+        mime="text/csv",
+        key="bl_download"
+    )
+
+
 def create_expandable_product_summary(df: pd.DataFrame):
     """Create expandable product summary with drill-down by category, with Vape breakdown by keywords"""
     
@@ -1352,6 +1624,12 @@ if st.session_state.all_products_data is None:
             all_products_df = calculate_production_flags(all_products_df)
         st.session_state.all_products_data = all_products_df
 
+if st.session_state.bl_inputs_data is None:
+    saved_bl, saved_bl_meta = load_saved_bl_inputs()
+    if saved_bl is not None:
+        st.session_state.bl_inputs_data = saved_bl
+        st.session_state.bl_inputs_metadata = saved_bl_meta
+
 # =============================================================================
 # STREAMLIT UI
 # =============================================================================
@@ -1370,6 +1648,29 @@ distru_file = st.sidebar.file_uploader(
     "Choose Distru CSV", type=['csv'], key="distru_upload",
     help="Upload the inventory assets report from Distru"
 )
+
+# Beyond Legends Input Materials (standalone - processes immediately on upload)
+st.sidebar.subheader("🧰 Beyond Legends Input Materials")
+bl_inputs_file = st.sidebar.file_uploader(
+    "Choose Beyond Legends Distru CSV", type=['csv'], key="bl_inputs_upload",
+    help="Upload the Distru Inventory Assets export from the Beyond Legends account. "
+         "Filters to Packaging + Supplies categories and aggregates by SKU."
+)
+
+if bl_inputs_file is not None:
+    with st.spinner("Parsing Beyond Legends input materials..."):
+        bl_parsed = load_bl_input_materials(bl_inputs_file)
+        if bl_parsed is not None and not bl_parsed.empty:
+            st.session_state.bl_inputs_data = bl_parsed
+            saved_ok = save_bl_inputs_data(bl_parsed, bl_inputs_file.name)
+            if saved_ok:
+                st.session_state.bl_inputs_metadata = {
+                    'last_updated': datetime.now().isoformat(),
+                    'source_file': bl_inputs_file.name,
+                    'sku_count': int(len(bl_parsed)),
+                    'total_value': float(bl_parsed['Total Cost (Actual)'].sum()),
+                }
+            st.sidebar.success(f"✅ {len(bl_parsed):,} input-material SKUs loaded")
 
 # Private Label Brands Management
 st.sidebar.markdown("---")
@@ -1459,8 +1760,8 @@ st.sidebar.markdown(f"**Version:** {st.session_state.app_version}")
 st.sidebar.markdown("**Last Updated:** April 2026")
 
 # Main Content Area
-if st.session_state.combined_data is not None:
-    combined_df = st.session_state.combined_data
+if st.session_state.combined_data is not None or st.session_state.bl_inputs_data is not None:
+    combined_df = st.session_state.combined_data  # may be None if only BL data is loaded
 
     # Display data freshness
     if st.session_state.saved_metadata:
@@ -1482,8 +1783,30 @@ if st.session_state.combined_data is not None:
         except (KeyError, ValueError):
             pass
 
-    # Create tabs
-    tab0, tab1, tab2, tab3, tab4 = st.tabs(["🚨 Private Label Production Alerts", "📊 Private Label Performance & Stock Dashboard", "🎯 Product Analysis", "📦 Distru Stock", "📋 Raw Data"])
+    # Create tabs. If the PL combined dataset is loaded, show the full 6-tab
+    # layout. Otherwise (BL-only upload) show just the BL Input Materials tab.
+    if combined_df is not None:
+        tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "🚨 Private Label Production Alerts",
+            "📊 Private Label Performance & Stock Dashboard",
+            "🎯 Product Analysis",
+            "📦 Distru Stock",
+            "🧰 Input Materials (BL)",
+            "📋 Raw Data"
+        ])
+    else:
+        (bl_only_tab,) = st.tabs(["🧰 Input Materials (BL)"])
+        with bl_only_tab:
+            render_bl_inputs_tab(
+                st.session_state.bl_inputs_data,
+                st.session_state.bl_inputs_metadata,
+            )
+        st.info(
+            "Showing Beyond Legends input materials only. "
+            "Upload Headset + Distru CSVs and click **Process Data** in the sidebar "
+            "to unlock the full dashboard (production alerts, performance, Distru stock, raw data)."
+        )
+        st.stop()
 
     # =========================================================================
     # ALERTS TAB
@@ -1948,8 +2271,14 @@ if st.session_state.combined_data is not None:
                     distru_display_df[col] = distru_display_df[col].round(1)
             
             st.dataframe(format_dataframe(distru_display_df), use_container_width=True, height=600)
-    
+
     with tab4:
+        render_bl_inputs_tab(
+            st.session_state.bl_inputs_data,
+            st.session_state.bl_inputs_metadata,
+        )
+
+    with tab5:
         st.header("📋 Raw Data")
         
         # Export functionality
