@@ -1701,57 +1701,69 @@ with st.sidebar.expander("View Brands"):
     for brand in current_brands:
         st.markdown(f"• {brand}")
 
-# Process Data Button
-if st.sidebar.button("🚀 Process Data", type="primary", disabled=not (headset_file and distru_file)):
-    with st.spinner("Processing your data..."):
-        # Load CSV files
-        headset_df = load_headset_data(headset_file)
-        distru_df = load_distru_data(distru_file)
-        
-        if headset_df is None or distru_df is None:
-            st.error("❌ Failed to load one or more files")
-            st.stop()
-        
-        # Store raw data in session state
-        st.session_state.headset_data = headset_df
-        st.session_state.distru_data = distru_df
-        
-        # Load current brands list
-        brands_list = load_brands_list()
+# Auto-process the PL pair when both Headset + Distru are uploaded and the
+# file signature has changed since the last processing pass. Streamlit reruns
+# the whole script on every widget interaction, so gating on signature change
+# avoids re-running the combine on every keystroke / click.
+if headset_file is not None and distru_file is not None:
+    current_pl_sig = (
+        headset_file.name, getattr(headset_file, 'size', None),
+        distru_file.name, getattr(distru_file, 'size', None),
+    )
+    if st.session_state.get('last_pl_sig') != current_pl_sig:
+        with st.spinner("Processing Headset + Distru data..."):
+            headset_df = load_headset_data(headset_file)
+            distru_df = load_distru_data(distru_file)
 
-        # Combine and process data (private label only)
-        combined_data = combine_inventory_data(headset_df, distru_df, brands_list=brands_list, filter_to_brands=True)
+            if headset_df is None or distru_df is None:
+                st.error("❌ Failed to load one or more files")
+            else:
+                st.session_state.headset_data = headset_df
+                st.session_state.distru_data = distru_df
 
-        if combined_data is not None:
-            combined_data = calculate_production_flags(combined_data)
-            st.session_state.combined_data = combined_data
+                brands_list = load_brands_list()
+                combined_data = combine_inventory_data(
+                    headset_df, distru_df, brands_list=brands_list, filter_to_brands=True
+                )
 
-            # Save to disk for persistence
-            saved = save_processed_data(
-                combined_data,
-                headset_file.name,
-                distru_file.name,
-                len(headset_df),
-                len(distru_df)
-            )
-            if saved:
-                st.session_state.saved_metadata = {
-                    'last_updated': datetime.now().isoformat(),
-                    'headset_file': headset_file.name,
-                    'distru_file': distru_file.name,
-                    'headset_rows': len(headset_df),
-                    'distru_rows': len(distru_df),
-                    'product_count': len(combined_data)
-                }
+                if combined_data is not None:
+                    combined_data = calculate_production_flags(combined_data)
+                    st.session_state.combined_data = combined_data
 
-            # Also process all products (for Product Analysis non-PL view)
-            all_products = combine_inventory_data(headset_df, distru_df, brands_list=brands_list, filter_to_brands=False)
-            if all_products is not None:
-                all_products = calculate_production_flags(all_products)
-                st.session_state.all_products_data = all_products
-                save_all_products_data(all_products)
+                    saved = save_processed_data(
+                        combined_data, headset_file.name, distru_file.name,
+                        len(headset_df), len(distru_df)
+                    )
+                    if saved:
+                        st.session_state.saved_metadata = {
+                            'last_updated': datetime.now().isoformat(),
+                            'headset_file': headset_file.name,
+                            'distru_file': distru_file.name,
+                            'headset_rows': len(headset_df),
+                            'distru_rows': len(distru_df),
+                            'product_count': len(combined_data),
+                        }
 
-            st.success(f"✅ Processed {len(combined_data):,} private label products ({len(all_products) if all_products is not None else 0:,} total). Data saved.")
+                    all_products = combine_inventory_data(
+                        headset_df, distru_df, brands_list=brands_list, filter_to_brands=False
+                    )
+                    if all_products is not None:
+                        all_products = calculate_production_flags(all_products)
+                        st.session_state.all_products_data = all_products
+                        save_all_products_data(all_products)
+
+                    st.sidebar.success(
+                        f"✅ {len(combined_data):,} private label products "
+                        f"({len(all_products) if all_products is not None else 0:,} total)"
+                    )
+                    st.session_state['last_pl_sig'] = current_pl_sig
+elif headset_file is not None or distru_file is not None:
+    missing = []
+    if headset_file is None:
+        missing.append("Headset")
+    if distru_file is None:
+        missing.append("Distru")
+    st.sidebar.info(f"ℹ️ Upload {' + '.join(missing)} to process PL data.")
 
 # Sidebar - Version Info
 st.sidebar.markdown("---")
@@ -1803,8 +1815,8 @@ if st.session_state.combined_data is not None or st.session_state.bl_inputs_data
             )
         st.info(
             "Showing Beyond Legends input materials only. "
-            "Upload Headset + Distru CSVs and click **Process Data** in the sidebar "
-            "to unlock the full dashboard (production alerts, performance, Distru stock, raw data)."
+            "Upload the Headset + Distru CSVs in the sidebar to unlock the full dashboard "
+            "(production alerts, performance, Distru stock, raw data). Processing is automatic."
         )
         st.stop()
 
@@ -2337,7 +2349,7 @@ else:
 
         with st.expander("ℹ️ How it Works", expanded=True):
             st.markdown(f"""
-            **📊 Upload** -> **🔄 Process** -> **💾 Save** -> **📈 Always Available**
+            **📊 Upload** -> **💾 Auto-save** -> **📈 Always Available**
 
             **Key Features:**
             - 💾 **Persistent data:** Upload once, dashboard stays available for everyone until next upload
@@ -2360,7 +2372,7 @@ else:
             """)
 
     elif headset_file and distru_file:
-        st.info("👈 Click the 'Process Data' button in the sidebar to analyze your files")
+        st.info("Both files are uploaded. If you don't see the dashboard, check the sidebar for an error above and try re-uploading.")
 
     else:
         missing_files = []
