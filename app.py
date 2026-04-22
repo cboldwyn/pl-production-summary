@@ -32,6 +32,7 @@ import io
 import os
 import json
 import math
+import re
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple
 import plotly.express as px
@@ -83,6 +84,38 @@ LATEST_DATA_PATH = os.path.join(DATA_DIR, "latest_combined.parquet")
 ALL_PRODUCTS_PATH = os.path.join(DATA_DIR, "latest_all_products.parquet")
 METADATA_PATH = os.path.join(DATA_DIR, "metadata.json")
 BRANDS_PATH = os.path.join(DATA_DIR, "private_label_brands.json")
+BL_INPUTS_PATH = os.path.join(DATA_DIR, "latest_bl_inputs.parquet")
+BL_INPUTS_META_PATH = os.path.join(DATA_DIR, "bl_inputs_metadata.json")
+
+# Brands we consider "Haven Private Label input materials" for the BL Input
+# Materials tab. This is broader than DEFAULT_PRIVATE_LABEL_BRANDS (which
+# filters retail inventory) because it also includes Beyond Legends-managed
+# brands whose packaging Jackie orders and tracks but which have different
+# retail channel treatment.
+HAVEN_PL_BRANDS_FOR_INPUT_MATERIALS = [
+    # True PL (Haven-owned lifecycle)
+    'Black Label Platinum', 'Black Label',
+    'Block Party Exotics', 'Block Party',
+    'Dope St. Exotics', 'Dope St.',
+    'Dunzo', 'Fat Stash', 'High Five',
+    "Lil' Buzzies", 'MikroDose', 'Nuggies', 'PTO', 'Roll & Ready',
+    # BL-managed (Beyond Legends owns lifecycle)
+    'Made from Dirt', 'Side Hustle', 'Pretty Dope', 'Crave', 'Daily Dose',
+    # Haven-adjacent inferred from packaging data
+    'Cloud9ne', 'Formula Gummies', 'Haven Hearts',
+]
+
+# Aliases seen in packaging product names that should resolve to a canonical
+# brand above. "SH Nug 3.5g" should match "Side Hustle", etc.
+PL_BRAND_ALIASES = {
+    'SH': 'Side Hustle',
+    'MFD': 'Made from Dirt',
+    'Dope ST': 'Dope St.',
+    'Dope St': 'Dope St.',
+    'Mikrodose': 'MikroDose',
+    'Lil Buzzies': "Lil' Buzzies",
+    'Haven Black Label': 'Black Label',
+}
 
 # =============================================================================
 # PAGE CONFIGURATION
@@ -103,14 +136,14 @@ st.markdown("**DC Retail** | Inventory analysis, production planning, and produc
 
 def initialize_session_state():
     """Initialize session state variables for data persistence"""
-    session_vars = ['headset_data', 'distru_data', 'combined_data', 'all_products_data', 'processed_data', 'app_version', 'saved_metadata', 'private_label_brands']
+    session_vars = ['headset_data', 'distru_data', 'combined_data', 'all_products_data', 'processed_data', 'app_version', 'saved_metadata', 'private_label_brands', 'bl_inputs_data', 'bl_inputs_metadata']
 
     for var in session_vars:
         if var not in st.session_state:
             st.session_state[var] = None
 
     if st.session_state.app_version is None:
-        st.session_state.app_version = "4.0.0"
+        st.session_state.app_version = "4.1.0"
 
 initialize_session_state()
 
@@ -781,6 +814,178 @@ def load_distru_data(uploaded_file) -> Optional[pd.DataFrame]:
         st.error(f"❌ Error loading Distru data: {str(e)}")
         return None
 
+
+def extract_pl_brand_from_name(product_name: Optional[str]) -> Optional[str]:
+    """
+    Look for a Haven PL brand inside a Distru packaging product name.
+
+    Packaging names are "Type - Brand Descriptor" (e.g. "Mylar - SH Nug 3.5g",
+    "CR Box - Pretty Dope 1g All-In-One"), so we match brand tokens anywhere
+    in the string using word-boundary regex. Aliases (SH, MFD, Dope ST, etc.)
+    resolve to their canonical brand. Longer brand names match before shorter
+    ones so "Black Label Platinum" wins over "Black Label".
+
+    Returns the canonical brand name or None if no match.
+    """
+    if not product_name or not isinstance(product_name, str):
+        return None
+
+    # Use a negative lookaround instead of \b so brand names containing
+    # punctuation (e.g. "Dope St.") match cleanly.
+    def _pattern(term):
+        return rf'(?<![A-Za-z]){re.escape(term)}(?![A-Za-z])'
+
+    # Aliases first, longest alias first
+    for alias, canonical in sorted(PL_BRAND_ALIASES.items(), key=lambda kv: -len(kv[0])):
+        if re.search(_pattern(alias), product_name, re.IGNORECASE):
+            return canonical
+
+    # Canonical brands, longest first to prefer "Black Label Platinum" over "Black Label"
+    for brand in sorted(HAVEN_PL_BRANDS_FOR_INPUT_MATERIALS, key=lambda b: -len(b)):
+        if re.search(_pattern(brand), product_name, re.IGNORECASE):
+            return brand
+
+    return None
+
+
+def load_bl_input_materials(uploaded_file) -> Optional[pd.DataFrame]:
+    """
+    Load and filter a Beyond Legends Distru Inventory Assets export down to
+    non-cannabis input materials (Packaging + Supplies), then aggregate by SKU
+    so each product shows a single total-on-hand row.
+
+    Distru emits one row per License (e.g. Manufacturing vs Distribution).
+    Jackie needs total on-hand per SKU for reorder decisions, so we sum
+    quantity and cost across licenses and join Location + License into
+    comma-delimited strings. Raw per-license rows are not preserved here;
+    they remain available by re-exporting from Distru if needed.
+
+    Args:
+        uploaded_file: Uploaded CSV from the Distru Inventory Assets report
+
+    Returns:
+        Aggregated DataFrame of input materials, or None on failure.
+    """
+    try:
+        df = pd.read_csv(uploaded_file, skiprows=2, dtype=str)
+
+        if df.empty:
+            st.error("❌ Beyond Legends file appears to be empty after skipping metadata rows")
+            return None
+
+        required = [
+            'Product', 'License', 'Location', 'Vendor', 'Unit Type',
+            'Active Quantity', 'Category', 'Subcategory',
+            'Unit Cost (Actual)', 'Total Cost (Actual)', 'Expiration Date'
+        ]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            st.error(f"❌ Beyond Legends file missing required columns: {', '.join(missing)}")
+            return None
+
+        if 'SKU' not in df.columns:
+            df['SKU'] = ''
+
+        # Numeric + date coercion
+        for col in ['Active Quantity', 'Unit Cost (Actual)', 'Total Cost (Actual)']:
+            df[col] = df[col].apply(lambda x: safe_numeric(x, 0))
+        df['Expiration Date'] = pd.to_datetime(df['Expiration Date'], errors='coerce')
+
+        # Filter to input materials only
+        df = df[df['Category'].isin(['Packaging', 'Supplies'])].copy()
+        if df.empty:
+            st.warning("⚠️ No Packaging or Supplies rows found in this export.")
+            return df
+
+        # Clean empty strings for filter / display
+        for col in ['Subcategory', 'Vendor', 'Location', 'Unit Type']:
+            df[col] = df[col].fillna('').astype(str).str.strip()
+            df.loc[df[col] == '', col] = '—'
+
+        # Normalize SKU for grouping: fall back to Product when SKU is blank
+        df['SKU'] = df['SKU'].fillna('').astype(str).str.strip()
+        df['_group_key'] = df['SKU'].where(df['SKU'] != '', df['Product'])
+
+        # Extract PL brand from the product name (per-row; identical across a
+        # SKU's license splits, so first_non_empty during aggregation is fine).
+        df['PL Brand'] = df['Product'].apply(extract_pl_brand_from_name)
+
+        def _first_non_empty(series):
+            for v in series:
+                if pd.notna(v) and str(v).strip() != '':
+                    return v
+            return ''
+
+        def _join_unique(series):
+            vals = sorted({str(v).strip() for v in series if pd.notna(v) and str(v).strip() not in ('', '—')})
+            return ', '.join(vals) if vals else '—'
+
+        grouped = df.groupby('_group_key', as_index=False).agg(
+            Product=('Product', _first_non_empty),
+            SKU=('SKU', _first_non_empty),
+            Vendor=('Vendor', _first_non_empty),
+            Category=('Category', _first_non_empty),
+            Subcategory=('Subcategory', _first_non_empty),
+            **{'PL Brand': ('PL Brand', _first_non_empty)},
+            **{'Unit Type': ('Unit Type', _first_non_empty)},
+            **{'Unit Cost (Actual)': ('Unit Cost (Actual)', _first_non_empty)},
+            **{'Active Quantity': ('Active Quantity', 'sum')},
+            **{'Total Cost (Actual)': ('Total Cost (Actual)', 'sum')},
+            Locations=('Location', _join_unique),
+            Licenses=('License', _join_unique),
+            **{'Earliest Expiration': ('Expiration Date', 'min')},
+        )
+
+        grouped = grouped.drop(columns=['_group_key'], errors='ignore')
+        return grouped
+
+    except Exception as e:
+        st.error(f"❌ Error loading Beyond Legends data: {str(e)}")
+        return None
+
+
+def save_bl_inputs_data(df: pd.DataFrame, source_filename: str) -> bool:
+    """Persist BL input materials to Parquet + a small metadata JSON."""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        save_df = df.copy()
+        for col in save_df.columns:
+            if hasattr(save_df[col], 'cat'):
+                save_df[col] = save_df[col].astype(str)
+        save_df.to_parquet(BL_INPUTS_PATH, index=False)
+
+        meta = {
+            'last_updated': datetime.now().isoformat(),
+            'source_file': source_filename,
+            'sku_count': int(len(df)),
+            'total_value': float(df['Total Cost (Actual)'].sum()) if 'Total Cost (Actual)' in df.columns else 0.0,
+        }
+        with open(BL_INPUTS_META_PATH, 'w') as f:
+            json.dump(meta, f, indent=2)
+        return True
+    except Exception as e:
+        st.warning(f"Could not save Beyond Legends input materials to disk: {str(e)}")
+        return False
+
+
+def load_saved_bl_inputs() -> Tuple[Optional[pd.DataFrame], Optional[dict]]:
+    """Load persisted BL input materials + metadata, if present."""
+    try:
+        if not os.path.exists(BL_INPUTS_PATH):
+            return None, None
+        df = pd.read_parquet(BL_INPUTS_PATH)
+        # Backfill PL Brand column for parquet files saved before brand
+        # extraction was added. Cheap to recompute on load.
+        if 'PL Brand' not in df.columns and 'Product' in df.columns:
+            df['PL Brand'] = df['Product'].apply(extract_pl_brand_from_name).fillna('')
+        meta = None
+        if os.path.exists(BL_INPUTS_META_PATH):
+            with open(BL_INPUTS_META_PATH, 'r') as f:
+                meta = json.load(f)
+        return df, meta
+    except Exception:
+        return None, None
+
 # =============================================================================
 # DATA PROCESSING FUNCTIONS
 # =============================================================================
@@ -1179,6 +1384,178 @@ def create_distru_stock_table(df: pd.DataFrame) -> pd.DataFrame:
         st.error(f"Error creating Distru stock table: {str(e)}")
         return pd.DataFrame()
 
+
+def render_bl_inputs_tab(df: Optional[pd.DataFrame], meta: Optional[dict] = None):
+    """
+    Render the Beyond Legends Input Materials tab.
+
+    v1 shows an aggregated SKU-level view of non-cannabis input materials
+    (Packaging + Supplies) with filters and CSV download. Default view filters
+    to Haven PL + BL-managed brands; toggle off to see all materials including
+    generic packaging. No weeks-on-hand or reorder points yet (no consumption
+    data available).
+    """
+    st.header("🧰 Input Materials, Beyond Legends")
+
+    if df is None or df.empty:
+        st.info("👈 Upload the Beyond Legends Distru Inventory Assets CSV in the sidebar to populate this tab.")
+        return
+
+    # Freshness caption
+    if meta:
+        try:
+            last_updated = datetime.fromisoformat(meta['last_updated'])
+            age_days = (datetime.now() - last_updated).days
+            if age_days < 1:
+                freshness = "Today"
+            elif age_days < 2:
+                freshness = "Yesterday"
+            else:
+                freshness = f"{age_days} days old"
+            st.caption(
+                f"Data from: {last_updated.strftime('%A %m/%d/%Y %I:%M %p')} ({freshness}) | "
+                f"Source: {meta.get('source_file', 'N/A')}"
+            )
+        except (KeyError, ValueError):
+            pass
+
+    # PL-only toggle: default on per Jackie's ordering workflow. Off reveals
+    # generic packaging (CR Pop Tubes, Glass Jars, Thermal Labels, etc.).
+    matched_count = int((df['PL Brand'].fillna('') != '').sum()) if 'PL Brand' in df.columns else 0
+    pl_only = st.toggle(
+        f"Private label brands only ({matched_count:,} of {len(df):,} SKUs)",
+        value=True,
+        key="bl_pl_only",
+        help=(
+            "On: filter to Haven PL + BL-managed brands (Dunzo, High Five, Side Hustle, "
+            "Pretty Dope, Crave, Daily Dose, Made from Dirt, etc.).\n"
+            "Off: also show generic packaging (pop tubes, glass jars, thermal labels)."
+        ),
+    )
+
+    scoped = df.copy()
+    if pl_only:
+        scoped = scoped[scoped['PL Brand'].fillna('') != '']
+
+    # Summary KPIs (computed on the scoped view)
+    total_value = float(scoped['Total Cost (Actual)'].sum()) if 'Total Cost (Actual)' in scoped.columns else 0.0
+    zero_low = int((scoped['Active Quantity'] <= 0).sum()) if 'Active Quantity' in scoped.columns else 0
+
+    if pl_only and 'PL Brand' in scoped.columns:
+        top_label = "Top PL Brands (by SKU)"
+        top_series = scoped['PL Brand'].value_counts().head(3)
+    else:
+        top_label = "Top Vendors (by SKU)"
+        top_series = scoped['Vendor'].value_counts().head(3) if 'Vendor' in scoped.columns else pd.Series(dtype=int)
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("SKUs", f"{len(scoped):,}")
+    col2.metric("Inventory Value", f"${total_value:,.0f}")
+    col3.metric("Zero/Low Stock", f"{zero_low:,}")
+    with col4:
+        st.markdown(f"**{top_label}**")
+        if not top_series.empty:
+            lines = [f"• {v} ({int(c)})" for v, c in top_series.items()]
+            st.markdown("<br/>".join(lines), unsafe_allow_html=True)
+        else:
+            st.markdown("—")
+
+    st.markdown("---")
+
+    # Filters (computed against scoped dataset so options reflect current scope)
+    filter_cols = st.columns(4)
+
+    with filter_cols[0]:
+        if pl_only:
+            brand_options = sorted(scoped['PL Brand'].dropna().unique().tolist())
+            selected_brands = st.multiselect(
+                "PL Brand", brand_options, default=brand_options, key="bl_brand"
+            )
+            selected_vendors = None
+        else:
+            vendor_options = sorted(scoped['Vendor'].dropna().unique().tolist())
+            selected_vendors = st.multiselect(
+                "Vendor", vendor_options, default=vendor_options, key="bl_vendor"
+            )
+            selected_brands = None
+
+    with filter_cols[1]:
+        subcat_options = sorted(scoped['Subcategory'].dropna().unique().tolist())
+        selected_subcats = st.multiselect(
+            "Subcategory", subcat_options, default=subcat_options, key="bl_subcat"
+        )
+
+    # Locations are comma-joined in aggregation; split for the filter list
+    all_locs = set()
+    for s in scoped['Locations'].dropna():
+        for loc in str(s).split(','):
+            loc = loc.strip()
+            if loc:
+                all_locs.add(loc)
+    loc_options = sorted(all_locs)
+
+    with filter_cols[2]:
+        selected_locs = st.multiselect(
+            "Location", loc_options, default=loc_options, key="bl_loc"
+        )
+
+    with filter_cols[3]:
+        search_term = st.text_input("Search product name", key="bl_search")
+
+    # Apply filters
+    filtered = scoped.copy()
+    if selected_brands is not None:
+        filtered = filtered[filtered['PL Brand'].isin(selected_brands)]
+    if selected_vendors is not None:
+        filtered = filtered[filtered['Vendor'].isin(selected_vendors)]
+    if selected_subcats:
+        filtered = filtered[filtered['Subcategory'].isin(selected_subcats)]
+    if selected_locs and selected_locs != loc_options:
+        loc_pattern = '|'.join(pd.Series(selected_locs).map(lambda s: s.replace('.', r'\.')))
+        filtered = filtered[filtered['Locations'].str.contains(loc_pattern, na=False, regex=True)]
+    if search_term:
+        filtered = filtered[filtered['Product'].str.contains(search_term, case=False, na=False)]
+
+    # Build display table. PL Brand column appears right after Product for quick scanning.
+    display_cols = ['Product', 'PL Brand', 'Subcategory', 'Vendor', 'Locations',
+                    'Active Quantity', 'Unit Type', 'Unit Cost (Actual)', 'Total Cost (Actual)']
+    has_expiry = 'Earliest Expiration' in filtered.columns and filtered['Earliest Expiration'].notna().any()
+    if has_expiry:
+        display_cols.append('Earliest Expiration')
+
+    display_df = filtered[display_cols].copy()
+    # Replace empty PL Brand with — for cleaner display when showing unmatched rows
+    display_df['PL Brand'] = display_df['PL Brand'].fillna('').astype(str)
+    display_df.loc[display_df['PL Brand'] == '', 'PL Brand'] = '—'
+
+    display_df = display_df.sort_values('Total Cost (Actual)', ascending=False)
+
+    if not display_df.empty:
+        qty = display_df['Active Quantity']
+        if ((qty.fillna(0) % 1) == 0).all():
+            display_df['Active Quantity'] = qty.fillna(0).astype(int)
+
+    zero_cost_ct = int((filtered['Total Cost (Actual)'] <= 0).sum()) if 'Total Cost (Actual)' in filtered.columns else 0
+    st.caption(
+        f"{len(filtered):,} of {len(scoped):,} SKUs shown. "
+        f"{zero_cost_ct} rows have $0 cost (often service or test items, left in view)."
+    )
+
+    st.dataframe(format_dataframe(display_df), use_container_width=True, hide_index=True, height=600)
+
+    # Download button
+    timestamp = datetime.now().strftime('%Y%m%d')
+    csv_buffer = io.StringIO()
+    display_df.to_csv(csv_buffer, index=False)
+    st.download_button(
+        label="⬇️ Download filtered CSV",
+        data=csv_buffer.getvalue(),
+        file_name=f"bl_input_materials_{timestamp}.csv",
+        mime="text/csv",
+        key="bl_download"
+    )
+
+
 def create_expandable_product_summary(df: pd.DataFrame):
     """Create expandable product summary with drill-down by category, with Vape breakdown by keywords"""
     
@@ -1352,6 +1729,12 @@ if st.session_state.all_products_data is None:
             all_products_df = calculate_production_flags(all_products_df)
         st.session_state.all_products_data = all_products_df
 
+if st.session_state.bl_inputs_data is None:
+    saved_bl, saved_bl_meta = load_saved_bl_inputs()
+    if saved_bl is not None:
+        st.session_state.bl_inputs_data = saved_bl
+        st.session_state.bl_inputs_metadata = saved_bl_meta
+
 # =============================================================================
 # STREAMLIT UI
 # =============================================================================
@@ -1370,6 +1753,29 @@ distru_file = st.sidebar.file_uploader(
     "Choose Distru CSV", type=['csv'], key="distru_upload",
     help="Upload the inventory assets report from Distru"
 )
+
+# Beyond Legends Input Materials (standalone - processes immediately on upload)
+st.sidebar.subheader("🧰 Beyond Legends Input Materials")
+bl_inputs_file = st.sidebar.file_uploader(
+    "Choose Beyond Legends Distru CSV", type=['csv'], key="bl_inputs_upload",
+    help="Upload the Distru Inventory Assets export from the Beyond Legends account. "
+         "Filters to Packaging + Supplies categories and aggregates by SKU."
+)
+
+if bl_inputs_file is not None:
+    with st.spinner("Parsing Beyond Legends input materials..."):
+        bl_parsed = load_bl_input_materials(bl_inputs_file)
+        if bl_parsed is not None and not bl_parsed.empty:
+            st.session_state.bl_inputs_data = bl_parsed
+            saved_ok = save_bl_inputs_data(bl_parsed, bl_inputs_file.name)
+            if saved_ok:
+                st.session_state.bl_inputs_metadata = {
+                    'last_updated': datetime.now().isoformat(),
+                    'source_file': bl_inputs_file.name,
+                    'sku_count': int(len(bl_parsed)),
+                    'total_value': float(bl_parsed['Total Cost (Actual)'].sum()),
+                }
+            st.sidebar.success(f"✅ {len(bl_parsed):,} input-material SKUs loaded")
 
 # Private Label Brands Management
 st.sidebar.markdown("---")
@@ -1400,57 +1806,69 @@ with st.sidebar.expander("View Brands"):
     for brand in current_brands:
         st.markdown(f"• {brand}")
 
-# Process Data Button
-if st.sidebar.button("🚀 Process Data", type="primary", disabled=not (headset_file and distru_file)):
-    with st.spinner("Processing your data..."):
-        # Load CSV files
-        headset_df = load_headset_data(headset_file)
-        distru_df = load_distru_data(distru_file)
-        
-        if headset_df is None or distru_df is None:
-            st.error("❌ Failed to load one or more files")
-            st.stop()
-        
-        # Store raw data in session state
-        st.session_state.headset_data = headset_df
-        st.session_state.distru_data = distru_df
-        
-        # Load current brands list
-        brands_list = load_brands_list()
+# Auto-process the PL pair when both Headset + Distru are uploaded and the
+# file signature has changed since the last processing pass. Streamlit reruns
+# the whole script on every widget interaction, so gating on signature change
+# avoids re-running the combine on every keystroke / click.
+if headset_file is not None and distru_file is not None:
+    current_pl_sig = (
+        headset_file.name, getattr(headset_file, 'size', None),
+        distru_file.name, getattr(distru_file, 'size', None),
+    )
+    if st.session_state.get('last_pl_sig') != current_pl_sig:
+        with st.spinner("Processing Headset + Distru data..."):
+            headset_df = load_headset_data(headset_file)
+            distru_df = load_distru_data(distru_file)
 
-        # Combine and process data (private label only)
-        combined_data = combine_inventory_data(headset_df, distru_df, brands_list=brands_list, filter_to_brands=True)
+            if headset_df is None or distru_df is None:
+                st.error("❌ Failed to load one or more files")
+            else:
+                st.session_state.headset_data = headset_df
+                st.session_state.distru_data = distru_df
 
-        if combined_data is not None:
-            combined_data = calculate_production_flags(combined_data)
-            st.session_state.combined_data = combined_data
+                brands_list = load_brands_list()
+                combined_data = combine_inventory_data(
+                    headset_df, distru_df, brands_list=brands_list, filter_to_brands=True
+                )
 
-            # Save to disk for persistence
-            saved = save_processed_data(
-                combined_data,
-                headset_file.name,
-                distru_file.name,
-                len(headset_df),
-                len(distru_df)
-            )
-            if saved:
-                st.session_state.saved_metadata = {
-                    'last_updated': datetime.now().isoformat(),
-                    'headset_file': headset_file.name,
-                    'distru_file': distru_file.name,
-                    'headset_rows': len(headset_df),
-                    'distru_rows': len(distru_df),
-                    'product_count': len(combined_data)
-                }
+                if combined_data is not None:
+                    combined_data = calculate_production_flags(combined_data)
+                    st.session_state.combined_data = combined_data
 
-            # Also process all products (for Product Analysis non-PL view)
-            all_products = combine_inventory_data(headset_df, distru_df, brands_list=brands_list, filter_to_brands=False)
-            if all_products is not None:
-                all_products = calculate_production_flags(all_products)
-                st.session_state.all_products_data = all_products
-                save_all_products_data(all_products)
+                    saved = save_processed_data(
+                        combined_data, headset_file.name, distru_file.name,
+                        len(headset_df), len(distru_df)
+                    )
+                    if saved:
+                        st.session_state.saved_metadata = {
+                            'last_updated': datetime.now().isoformat(),
+                            'headset_file': headset_file.name,
+                            'distru_file': distru_file.name,
+                            'headset_rows': len(headset_df),
+                            'distru_rows': len(distru_df),
+                            'product_count': len(combined_data),
+                        }
 
-            st.success(f"✅ Processed {len(combined_data):,} private label products ({len(all_products) if all_products is not None else 0:,} total). Data saved.")
+                    all_products = combine_inventory_data(
+                        headset_df, distru_df, brands_list=brands_list, filter_to_brands=False
+                    )
+                    if all_products is not None:
+                        all_products = calculate_production_flags(all_products)
+                        st.session_state.all_products_data = all_products
+                        save_all_products_data(all_products)
+
+                    st.sidebar.success(
+                        f"✅ {len(combined_data):,} private label products "
+                        f"({len(all_products) if all_products is not None else 0:,} total)"
+                    )
+                    st.session_state['last_pl_sig'] = current_pl_sig
+elif headset_file is not None or distru_file is not None:
+    missing = []
+    if headset_file is None:
+        missing.append("Headset")
+    if distru_file is None:
+        missing.append("Distru")
+    st.sidebar.info(f"ℹ️ Upload {' + '.join(missing)} to process PL data.")
 
 # Sidebar - Version Info
 st.sidebar.markdown("---")
@@ -1459,8 +1877,8 @@ st.sidebar.markdown(f"**Version:** {st.session_state.app_version}")
 st.sidebar.markdown("**Last Updated:** April 2026")
 
 # Main Content Area
-if st.session_state.combined_data is not None:
-    combined_df = st.session_state.combined_data
+if st.session_state.combined_data is not None or st.session_state.bl_inputs_data is not None:
+    combined_df = st.session_state.combined_data  # may be None if only BL data is loaded
 
     # Display data freshness
     if st.session_state.saved_metadata:
@@ -1482,8 +1900,30 @@ if st.session_state.combined_data is not None:
         except (KeyError, ValueError):
             pass
 
-    # Create tabs
-    tab0, tab1, tab2, tab3, tab4 = st.tabs(["🚨 Private Label Production Alerts", "📊 Private Label Performance & Stock Dashboard", "🎯 Product Analysis", "📦 Distru Stock", "📋 Raw Data"])
+    # Create tabs. If the PL combined dataset is loaded, show the full 6-tab
+    # layout. Otherwise (BL-only upload) show just the BL Input Materials tab.
+    if combined_df is not None:
+        tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "🚨 Private Label Production Alerts",
+            "📊 Private Label Performance & Stock Dashboard",
+            "🎯 Product Analysis",
+            "📦 Distru Stock",
+            "🧰 Input Materials (BL)",
+            "📋 Raw Data"
+        ])
+    else:
+        (bl_only_tab,) = st.tabs(["🧰 Input Materials (BL)"])
+        with bl_only_tab:
+            render_bl_inputs_tab(
+                st.session_state.bl_inputs_data,
+                st.session_state.bl_inputs_metadata,
+            )
+        st.info(
+            "Showing Beyond Legends input materials only. "
+            "Upload the Headset + Distru CSVs in the sidebar to unlock the full dashboard "
+            "(production alerts, performance, Distru stock, raw data). Processing is automatic."
+        )
+        st.stop()
 
     # =========================================================================
     # ALERTS TAB
@@ -1948,8 +2388,14 @@ if st.session_state.combined_data is not None:
                     distru_display_df[col] = distru_display_df[col].round(1)
             
             st.dataframe(format_dataframe(distru_display_df), use_container_width=True, height=600)
-    
+
     with tab4:
+        render_bl_inputs_tab(
+            st.session_state.bl_inputs_data,
+            st.session_state.bl_inputs_metadata,
+        )
+
+    with tab5:
         st.header("📋 Raw Data")
         
         # Export functionality
@@ -2008,7 +2454,7 @@ else:
 
         with st.expander("ℹ️ How it Works", expanded=True):
             st.markdown(f"""
-            **📊 Upload** -> **🔄 Process** -> **💾 Save** -> **📈 Always Available**
+            **📊 Upload** -> **💾 Auto-save** -> **📈 Always Available**
 
             **Key Features:**
             - 💾 **Persistent data:** Upload once, dashboard stays available for everyone until next upload
@@ -2031,7 +2477,7 @@ else:
             """)
 
     elif headset_file and distru_file:
-        st.info("👈 Click the 'Process Data' button in the sidebar to analyze your files")
+        st.info("Both files are uploaded. If you don't see the dashboard, check the sidebar for an error above and try re-uploading.")
 
     else:
         missing_files = []
