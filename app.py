@@ -143,7 +143,7 @@ def initialize_session_state():
             st.session_state[var] = None
 
     if st.session_state.app_version is None:
-        st.session_state.app_version = "4.0.0"
+        st.session_state.app_version = "4.1.0"
 
 initialize_session_state()
 
