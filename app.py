@@ -32,6 +32,7 @@ import io
 import os
 import json
 import math
+import re
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple
 import plotly.express as px
@@ -85,6 +86,36 @@ METADATA_PATH = os.path.join(DATA_DIR, "metadata.json")
 BRANDS_PATH = os.path.join(DATA_DIR, "private_label_brands.json")
 BL_INPUTS_PATH = os.path.join(DATA_DIR, "latest_bl_inputs.parquet")
 BL_INPUTS_META_PATH = os.path.join(DATA_DIR, "bl_inputs_metadata.json")
+
+# Brands we consider "Haven Private Label input materials" for the BL Input
+# Materials tab. This is broader than DEFAULT_PRIVATE_LABEL_BRANDS (which
+# filters retail inventory) because it also includes Beyond Legends-managed
+# brands whose packaging Jackie orders and tracks but which have different
+# retail channel treatment.
+HAVEN_PL_BRANDS_FOR_INPUT_MATERIALS = [
+    # True PL (Haven-owned lifecycle)
+    'Black Label Platinum', 'Black Label',
+    'Block Party Exotics', 'Block Party',
+    'Dope St. Exotics', 'Dope St.',
+    'Dunzo', 'Fat Stash', 'High Five',
+    "Lil' Buzzies", 'MikroDose', 'Nuggies', 'PTO', 'Roll & Ready',
+    # BL-managed (Beyond Legends owns lifecycle)
+    'Made from Dirt', 'Side Hustle', 'Pretty Dope', 'Crave', 'Daily Dose',
+    # Haven-adjacent inferred from packaging data
+    'Cloud9ne', 'Formula Gummies', 'Haven Hearts',
+]
+
+# Aliases seen in packaging product names that should resolve to a canonical
+# brand above. "SH Nug 3.5g" should match "Side Hustle", etc.
+PL_BRAND_ALIASES = {
+    'SH': 'Side Hustle',
+    'MFD': 'Made from Dirt',
+    'Dope ST': 'Dope St.',
+    'Dope St': 'Dope St.',
+    'Mikrodose': 'MikroDose',
+    'Lil Buzzies': "Lil' Buzzies",
+    'Haven Black Label': 'Black Label',
+}
 
 # =============================================================================
 # PAGE CONFIGURATION
@@ -784,6 +815,39 @@ def load_distru_data(uploaded_file) -> Optional[pd.DataFrame]:
         return None
 
 
+def extract_pl_brand_from_name(product_name: Optional[str]) -> Optional[str]:
+    """
+    Look for a Haven PL brand inside a Distru packaging product name.
+
+    Packaging names are "Type - Brand Descriptor" (e.g. "Mylar - SH Nug 3.5g",
+    "CR Box - Pretty Dope 1g All-In-One"), so we match brand tokens anywhere
+    in the string using word-boundary regex. Aliases (SH, MFD, Dope ST, etc.)
+    resolve to their canonical brand. Longer brand names match before shorter
+    ones so "Black Label Platinum" wins over "Black Label".
+
+    Returns the canonical brand name or None if no match.
+    """
+    if not product_name or not isinstance(product_name, str):
+        return None
+
+    # Use a negative lookaround instead of \b so brand names containing
+    # punctuation (e.g. "Dope St.") match cleanly.
+    def _pattern(term):
+        return rf'(?<![A-Za-z]){re.escape(term)}(?![A-Za-z])'
+
+    # Aliases first, longest alias first
+    for alias, canonical in sorted(PL_BRAND_ALIASES.items(), key=lambda kv: -len(kv[0])):
+        if re.search(_pattern(alias), product_name, re.IGNORECASE):
+            return canonical
+
+    # Canonical brands, longest first to prefer "Black Label Platinum" over "Black Label"
+    for brand in sorted(HAVEN_PL_BRANDS_FOR_INPUT_MATERIALS, key=lambda b: -len(b)):
+        if re.search(_pattern(brand), product_name, re.IGNORECASE):
+            return brand
+
+    return None
+
+
 def load_bl_input_materials(uploaded_file) -> Optional[pd.DataFrame]:
     """
     Load and filter a Beyond Legends Distru Inventory Assets export down to
@@ -842,6 +906,10 @@ def load_bl_input_materials(uploaded_file) -> Optional[pd.DataFrame]:
         df['SKU'] = df['SKU'].fillna('').astype(str).str.strip()
         df['_group_key'] = df['SKU'].where(df['SKU'] != '', df['Product'])
 
+        # Extract PL brand from the product name (per-row; identical across a
+        # SKU's license splits, so first_non_empty during aggregation is fine).
+        df['PL Brand'] = df['Product'].apply(extract_pl_brand_from_name)
+
         def _first_non_empty(series):
             for v in series:
                 if pd.notna(v) and str(v).strip() != '':
@@ -858,6 +926,7 @@ def load_bl_input_materials(uploaded_file) -> Optional[pd.DataFrame]:
             Vendor=('Vendor', _first_non_empty),
             Category=('Category', _first_non_empty),
             Subcategory=('Subcategory', _first_non_empty),
+            **{'PL Brand': ('PL Brand', _first_non_empty)},
             **{'Unit Type': ('Unit Type', _first_non_empty)},
             **{'Unit Cost (Actual)': ('Unit Cost (Actual)', _first_non_empty)},
             **{'Active Quantity': ('Active Quantity', 'sum')},
@@ -905,6 +974,10 @@ def load_saved_bl_inputs() -> Tuple[Optional[pd.DataFrame], Optional[dict]]:
         if not os.path.exists(BL_INPUTS_PATH):
             return None, None
         df = pd.read_parquet(BL_INPUTS_PATH)
+        # Backfill PL Brand column for parquet files saved before brand
+        # extraction was added. Cheap to recompute on load.
+        if 'PL Brand' not in df.columns and 'Product' in df.columns:
+            df['PL Brand'] = df['Product'].apply(extract_pl_brand_from_name).fillna('')
         meta = None
         if os.path.exists(BL_INPUTS_META_PATH):
             with open(BL_INPUTS_META_PATH, 'r') as f:
@@ -1317,8 +1390,10 @@ def render_bl_inputs_tab(df: Optional[pd.DataFrame], meta: Optional[dict] = None
     Render the Beyond Legends Input Materials tab.
 
     v1 shows an aggregated SKU-level view of non-cannabis input materials
-    (Packaging + Supplies) with filters and CSV download. No weeks-on-hand or
-    reorder points in v1 (no consumption data available yet).
+    (Packaging + Supplies) with filters and CSV download. Default view filters
+    to Haven PL + BL-managed brands; toggle off to see all materials including
+    generic packaging. No weeks-on-hand or reorder points yet (no consumption
+    data available).
     """
     st.header("🧰 Input Materials, Beyond Legends")
 
@@ -1344,47 +1419,75 @@ def render_bl_inputs_tab(df: Optional[pd.DataFrame], meta: Optional[dict] = None
         except (KeyError, ValueError):
             pass
 
-    # Summary KPIs
-    total_value = float(df['Total Cost (Actual)'].sum()) if 'Total Cost (Actual)' in df.columns else 0.0
-    zero_low = int((df['Active Quantity'] <= 0).sum()) if 'Active Quantity' in df.columns else 0
-    top_vendors = (
-        df['Vendor'].value_counts().head(3)
-        if 'Vendor' in df.columns else pd.Series(dtype=int)
+    # PL-only toggle: default on per Jackie's ordering workflow. Off reveals
+    # generic packaging (CR Pop Tubes, Glass Jars, Thermal Labels, etc.).
+    matched_count = int((df['PL Brand'].fillna('') != '').sum()) if 'PL Brand' in df.columns else 0
+    pl_only = st.toggle(
+        f"Private label brands only ({matched_count:,} of {len(df):,} SKUs)",
+        value=True,
+        key="bl_pl_only",
+        help=(
+            "On: filter to Haven PL + BL-managed brands (Dunzo, High Five, Side Hustle, "
+            "Pretty Dope, Crave, Daily Dose, Made from Dirt, etc.).\n"
+            "Off: also show generic packaging (pop tubes, glass jars, thermal labels)."
+        ),
     )
 
+    scoped = df.copy()
+    if pl_only:
+        scoped = scoped[scoped['PL Brand'].fillna('') != '']
+
+    # Summary KPIs (computed on the scoped view)
+    total_value = float(scoped['Total Cost (Actual)'].sum()) if 'Total Cost (Actual)' in scoped.columns else 0.0
+    zero_low = int((scoped['Active Quantity'] <= 0).sum()) if 'Active Quantity' in scoped.columns else 0
+
+    if pl_only and 'PL Brand' in scoped.columns:
+        top_label = "Top PL Brands (by SKU)"
+        top_series = scoped['PL Brand'].value_counts().head(3)
+    else:
+        top_label = "Top Vendors (by SKU)"
+        top_series = scoped['Vendor'].value_counts().head(3) if 'Vendor' in scoped.columns else pd.Series(dtype=int)
+
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("SKUs", f"{len(df):,}")
+    col1.metric("SKUs", f"{len(scoped):,}")
     col2.metric("Inventory Value", f"${total_value:,.0f}")
-    with col3:
-        st.metric("Zero/Low Stock", f"{zero_low:,}")
+    col3.metric("Zero/Low Stock", f"{zero_low:,}")
     with col4:
-        st.markdown("**Top Vendors**")
-        if not top_vendors.empty:
-            lines = [f"• {v} ({int(c)})" for v, c in top_vendors.items()]
+        st.markdown(f"**{top_label}**")
+        if not top_series.empty:
+            lines = [f"• {v} ({int(c)})" for v, c in top_series.items()]
             st.markdown("<br/>".join(lines), unsafe_allow_html=True)
         else:
             st.markdown("—")
 
     st.markdown("---")
 
-    # Filters
+    # Filters (computed against scoped dataset so options reflect current scope)
     filter_cols = st.columns(4)
 
     with filter_cols[0]:
-        vendor_options = sorted(df['Vendor'].dropna().unique().tolist())
-        selected_vendors = st.multiselect(
-            "Vendor", vendor_options, default=vendor_options, key="bl_vendor"
-        )
+        if pl_only:
+            brand_options = sorted(scoped['PL Brand'].dropna().unique().tolist())
+            selected_brands = st.multiselect(
+                "PL Brand", brand_options, default=brand_options, key="bl_brand"
+            )
+            selected_vendors = None
+        else:
+            vendor_options = sorted(scoped['Vendor'].dropna().unique().tolist())
+            selected_vendors = st.multiselect(
+                "Vendor", vendor_options, default=vendor_options, key="bl_vendor"
+            )
+            selected_brands = None
 
     with filter_cols[1]:
-        subcat_options = sorted(df['Subcategory'].dropna().unique().tolist())
+        subcat_options = sorted(scoped['Subcategory'].dropna().unique().tolist())
         selected_subcats = st.multiselect(
             "Subcategory", subcat_options, default=subcat_options, key="bl_subcat"
         )
 
     # Locations are comma-joined in aggregation; split for the filter list
     all_locs = set()
-    for s in df['Locations'].dropna():
+    for s in scoped['Locations'].dropna():
         for loc in str(s).split(','):
             loc = loc.strip()
             if loc:
@@ -1400,8 +1503,10 @@ def render_bl_inputs_tab(df: Optional[pd.DataFrame], meta: Optional[dict] = None
         search_term = st.text_input("Search product name", key="bl_search")
 
     # Apply filters
-    filtered = df.copy()
-    if selected_vendors:
+    filtered = scoped.copy()
+    if selected_brands is not None:
+        filtered = filtered[filtered['PL Brand'].isin(selected_brands)]
+    if selected_vendors is not None:
         filtered = filtered[filtered['Vendor'].isin(selected_vendors)]
     if selected_subcats:
         filtered = filtered[filtered['Subcategory'].isin(selected_subcats)]
@@ -1411,20 +1516,20 @@ def render_bl_inputs_tab(df: Optional[pd.DataFrame], meta: Optional[dict] = None
     if search_term:
         filtered = filtered[filtered['Product'].str.contains(search_term, case=False, na=False)]
 
-    # Build display table
-    display_cols = [
-        'Product', 'Subcategory', 'Vendor', 'Locations',
-        'Active Quantity', 'Unit Type', 'Unit Cost (Actual)', 'Total Cost (Actual)'
-    ]
-    # Conditionally append expiration column
+    # Build display table. PL Brand column appears right after Product for quick scanning.
+    display_cols = ['Product', 'PL Brand', 'Subcategory', 'Vendor', 'Locations',
+                    'Active Quantity', 'Unit Type', 'Unit Cost (Actual)', 'Total Cost (Actual)']
     has_expiry = 'Earliest Expiration' in filtered.columns and filtered['Earliest Expiration'].notna().any()
     if has_expiry:
         display_cols.append('Earliest Expiration')
 
     display_df = filtered[display_cols].copy()
+    # Replace empty PL Brand with — for cleaner display when showing unmatched rows
+    display_df['PL Brand'] = display_df['PL Brand'].fillna('').astype(str)
+    display_df.loc[display_df['PL Brand'] == '', 'PL Brand'] = '—'
+
     display_df = display_df.sort_values('Total Cost (Actual)', ascending=False)
 
-    # Tidy numeric formatting. Show Active Quantity as integer when all values are whole.
     if not display_df.empty:
         qty = display_df['Active Quantity']
         if ((qty.fillna(0) % 1) == 0).all():
@@ -1432,7 +1537,7 @@ def render_bl_inputs_tab(df: Optional[pd.DataFrame], meta: Optional[dict] = None
 
     zero_cost_ct = int((filtered['Total Cost (Actual)'] <= 0).sum()) if 'Total Cost (Actual)' in filtered.columns else 0
     st.caption(
-        f"{len(filtered):,} of {len(df):,} SKUs shown. "
+        f"{len(filtered):,} of {len(scoped):,} SKUs shown. "
         f"{zero_cost_ct} rows have $0 cost (often service or test items, left in view)."
     )
 
