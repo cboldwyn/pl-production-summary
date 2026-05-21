@@ -8,7 +8,7 @@ assets reports to calculate Weeks on Hand (WOH) and generate insights across
 private label and all product categories.
 
 Author: DC Retail
-Version: 4.0.0 - Dynamic brands list + all-products view
+Version: 4.1.1 - Brands CSV upload triggers dashboard refresh + decimal cleanup
 Date: 2026
 
 Key Features:
@@ -143,7 +143,7 @@ def initialize_session_state():
             st.session_state[var] = None
 
     if st.session_state.app_version is None:
-        st.session_state.app_version = "4.1.0"
+        st.session_state.app_version = "4.1.1"
 
 initialize_session_state()
 
@@ -712,24 +712,40 @@ def style_flag_dataframe(df: pd.DataFrame, flag_column: str = 'Flag'):
         style = flag_colors.get(flag, '')
         return [style] * len(row)
 
-    # Build format dict for float columns that should display as 1 decimal
-    format_dict = {}
-    for col in df.columns:
-        if col in ('Daily Sales', 'WOH', 'In Stock Avg Units per Day'):
-            format_dict[col] = '{:.1f}'
-
+    format_dict = _number_format_dict(df)
     styled = df.style.apply(apply_row_style, axis=1)
     if format_dict:
         styled = styled.format(format_dict)
     return styled
 
 
-def format_dataframe(df: pd.DataFrame):
-    """Apply consistent number formatting (1 decimal) to Daily Sales and WOH columns."""
-    format_dict = {}
+# Columns that should always render with 1 decimal (rates of sale, weeks).
+_RATE_COLS = frozenset({'Daily Sales', 'WOH', 'In Stock Avg Units per Day'})
+# Columns that should always render as integers with thousands separators
+# (unit counts, store counts, day counts).
+_COUNT_COLS = frozenset({
+    'Total Inventory', 'Distru Quantity', 'Store Count',
+    'Total Products', 'Distro Products', 'Total Store Presence',
+    'Distru Days Supply',
+})
+
+
+def _number_format_dict(df: pd.DataFrame) -> dict:
+    """Return a pandas-styler format dict applying the project number standard:
+    1 decimal for rates of sale, 0 decimals for unit counts.
+    """
+    fmt = {}
     for col in df.columns:
-        if col in ('Daily Sales', 'WOH', 'In Stock Avg Units per Day'):
-            format_dict[col] = '{:.1f}'
+        if col in _RATE_COLS:
+            fmt[col] = '{:.1f}'
+        elif col in _COUNT_COLS:
+            fmt[col] = '{:,.0f}'
+    return fmt
+
+
+def format_dataframe(df: pd.DataFrame):
+    """Apply project number standard: 1 decimal for rates of sale, 0 for counts."""
+    format_dict = _number_format_dict(df)
     if format_dict:
         return df.style.format(format_dict)
     return df
@@ -1703,7 +1719,10 @@ def create_expandable_product_summary(df: pd.DataFrame):
                             display_df = category_products[display_columns].copy()
                             display_df = display_df.rename(columns={'In Stock Avg Units per Day': 'Daily Sales'})
 
-                            for col in ['Total Inventory', 'Distru Quantity', 'Daily Sales', 'WOH']:
+                            for col in ['Total Inventory', 'Distru Quantity', 'Store Count']:
+                                if col in display_df.columns:
+                                    display_df[col] = display_df[col].astype(int)
+                            for col in ['Daily Sales', 'WOH']:
                                 if col in display_df.columns:
                                     display_df[col] = display_df[col].round(1)
 
@@ -1800,6 +1819,14 @@ if brands_csv is not None:
             st.session_state.private_label_brands = parsed_brands
             current_brands = parsed_brands
             st.sidebar.success(f"Updated to {len(parsed_brands)} brands")
+            # Force the Headset+Distru handler below to re-combine with the new
+            # brands list. That handler skips work when the file signature matches
+            # the prior run, so we invalidate the signature here.
+            st.session_state['last_pl_sig'] = None
+            if headset_file is None or distru_file is None:
+                st.sidebar.warning(
+                    "Re-upload Headset + Distru CSVs to apply the new brands list to the dashboard."
+                )
 
 st.sidebar.caption(f"Tracking {len(current_brands)} brands:")
 with st.sidebar.expander("View Brands"):
