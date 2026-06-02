@@ -87,6 +87,12 @@ BRANDS_PATH = os.path.join(DATA_DIR, "private_label_brands.json")
 BL_INPUTS_PATH = os.path.join(DATA_DIR, "latest_bl_inputs.parquet")
 BL_INPUTS_META_PATH = os.path.join(DATA_DIR, "bl_inputs_metadata.json")
 
+# Curated list of packaging components Haven actively tracks for reorder
+# planning (the filtered Daisuke/BL component list reconciled to Distru product
+# names). Lives at the repo root (NOT in data/, which is gitignored runtime
+# state) so the tracked universe is version-controlled config.
+TRACKED_COMPONENTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tracked_components.csv")
+
 # Brands we consider "Haven Private Label input materials" for the BL Input
 # Materials tab. This is broader than DEFAULT_PRIVATE_LABEL_BRANDS (which
 # filters retail inventory) because it also includes Beyond Legends-managed
@@ -143,7 +149,7 @@ def initialize_session_state():
             st.session_state[var] = None
 
     if st.session_state.app_version is None:
-        st.session_state.app_version = "4.1.1"
+        st.session_state.app_version = "4.2.0"
 
 initialize_session_state()
 
@@ -1002,6 +1008,29 @@ def load_saved_bl_inputs() -> Tuple[Optional[pd.DataFrame], Optional[dict]]:
     except Exception:
         return None, None
 
+
+def _norm_match_key(s) -> str:
+    """Normalize a product name for matching: collapse whitespace, lowercase."""
+    return re.sub(r'\s+', ' ', str(s or '')).strip().lower()
+
+
+@st.cache_data
+def load_tracked_components() -> Optional[pd.DataFrame]:
+    """Load the curated tracked-components list (committed config at repo root).
+
+    One row per packaging component Haven actively reorders, reconciled to the
+    Distru product name. Columns: distru_product, sku, haven_component, brand,
+    pkg_type. Returns None if the file is absent so the tab degrades gracefully
+    to the brand-based scopes.
+    """
+    try:
+        if not os.path.exists(TRACKED_COMPONENTS_PATH):
+            return None
+        df = pd.read_csv(TRACKED_COMPONENTS_PATH, dtype=str).fillna('')
+        return df if not df.empty else None
+    except Exception:
+        return None
+
 # =============================================================================
 # DATA PROCESSING FUNCTIONS
 # =============================================================================
@@ -1405,11 +1434,12 @@ def render_bl_inputs_tab(df: Optional[pd.DataFrame], meta: Optional[dict] = None
     """
     Render the Beyond Legends Input Materials tab.
 
-    v1 shows an aggregated SKU-level view of non-cannabis input materials
-    (Packaging + Supplies) with filters and CSV download. Default view filters
-    to Haven PL + BL-managed brands; toggle off to see all materials including
-    generic packaging. No weeks-on-hand or reorder points yet (no consumption
-    data available).
+    Aggregated SKU-level view of non-cannabis input materials (Packaging +
+    Supplies) with filters and CSV download. Default scope is the curated
+    "Tracked components" list (tracked_components.csv), the packaging Haven
+    actively reorders. Widen to "All PL brands" or "All materials" via the scope
+    selector. Weeks-on-hand / reorder points are blended in once sell-through is
+    joined (step 3).
     """
     st.header("🧰 Input Materials, Beyond Legends")
 
@@ -1435,23 +1465,77 @@ def render_bl_inputs_tab(df: Optional[pd.DataFrame], meta: Optional[dict] = None
         except (KeyError, ValueError):
             pass
 
-    # PL-only toggle: default on per Jackie's ordering workflow. Off reveals
-    # generic packaging (CR Pop Tubes, Glass Jars, Thermal Labels, etc.).
-    matched_count = int((df['PL Brand'].fillna('') != '').sum()) if 'PL Brand' in df.columns else 0
-    pl_only = st.toggle(
-        f"Private label brands only ({matched_count:,} of {len(df):,} SKUs)",
-        value=True,
-        key="bl_pl_only",
+    # --- Scope selector ---------------------------------------------------
+    # "Tracked components" (default) = the curated reorder-tracking list
+    # (Daisuke/BL component list reconciled to Distru). "All PL brands" = every
+    # PL/BL-managed brand's packaging. "All materials" = everything including
+    # generic packaging.
+    df = df.copy()
+    tracked_df = load_tracked_components()
+    tracked_keys, tracked_skus, tracked_total = set(), set(), 0
+    if tracked_df is not None and not tracked_df.empty:
+        tracked_total = len(tracked_df)
+        tracked_keys = {_norm_match_key(n) for n in tracked_df['distru_product']}
+        for s in tracked_df['sku']:
+            for part in str(s).split(';'):
+                part = re.sub(r'\s+', '', part).strip().lower()
+                if part:
+                    tracked_skus.add(part)
+
+    def _is_tracked(row):
+        if _norm_match_key(row.get('Product', '')) in tracked_keys:
+            return True
+        sku = re.sub(r'\s+', '', str(row.get('SKU', ''))).strip().lower()
+        return bool(sku) and sku in tracked_skus
+
+    df['_tracked'] = df.apply(_is_tracked, axis=1) if tracked_total else False
+    present = int(df['_tracked'].sum()) if tracked_total else 0
+
+    scope_options = []
+    if tracked_total:
+        scope_options.append(f"Tracked components ({present} of {tracked_total})")
+    scope_options += ["All PL brands", "All materials"]
+    scope = st.radio(
+        "Scope", scope_options, index=0, horizontal=True, key="bl_scope",
         help=(
-            "On: filter to Haven PL + BL-managed brands (Dunzo, High Five, Side Hustle, "
-            "Pretty Dope, Crave, Daily Dose, Made from Dirt, etc.).\n"
-            "Off: also show generic packaging (pop tubes, glass jars, thermal labels)."
+            "Tracked components: the curated reorder-tracking list "
+            "(tracked_components.csv).\n"
+            "All PL brands: every Haven PL + BL-managed brand's packaging.\n"
+            "All materials: everything, including generic packaging."
         ),
     )
 
-    scoped = df.copy()
-    if pl_only:
-        scoped = scoped[scoped['PL Brand'].fillna('') != '']
+    if scope.startswith("Tracked components"):
+        scoped = df[df['_tracked']].copy()
+        pl_only = True
+    elif scope == "All PL brands":
+        scoped = df[df['PL Brand'].fillna('') != ''].copy()
+        pl_only = True
+    else:
+        scoped = df.copy()
+        pl_only = False
+
+    # When in tracked scope, surface any tracked component missing from this
+    # Distru upload (e.g. drained to zero and dropped from the export).
+    if scope.startswith("Tracked components") and tracked_total and present < tracked_total:
+        present_keys = {_norm_match_key(p) for p in scoped['Product']}
+        present_skus = {re.sub(r'\s+', '', str(s)).strip().lower() for s in scoped.get('SKU', pd.Series(dtype=str))}
+
+        def _row_present(r):
+            if _norm_match_key(r['distru_product']) in present_keys:
+                return True
+            return any(
+                re.sub(r'\s+', '', part).strip().lower() in present_skus
+                for part in str(r['sku']).split(';') if part.strip()
+            )
+
+        missing = tracked_df[~tracked_df.apply(_row_present, axis=1)]
+        if not missing.empty:
+            with st.expander(f"⚠️ {len(missing)} tracked component(s) not in this Distru upload"):
+                st.dataframe(
+                    missing[['haven_component', 'brand', 'pkg_type', 'sku']],
+                    hide_index=True, use_container_width=True,
+                )
 
     # Summary KPIs (computed on the scoped view)
     total_value = float(scoped['Total Cost (Actual)'].sum()) if 'Total Cost (Actual)' in scoped.columns else 0.0
