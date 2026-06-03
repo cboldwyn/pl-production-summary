@@ -142,6 +142,18 @@ JAR_BRAND_DEFAULT_SIZE = {
     'High Five': '5g', 'Black Label Platinum': '3.5g', 'PTO': '3.5g', 'Dope St.': '14g',
 }
 
+# Columns of the tracked-components config (tracked_components.csv).
+TRACKED_COMPONENT_COLUMNS = ['distru_product', 'sku', 'haven_component', 'brand', 'pkg_type']
+
+# Brand-spelling reconciliations between Headset sell-through and the packaging
+# brand columns. Used wherever a BOM match_brand is compared to a Headset brand
+# (the coverage check now, the reorder join when it is built) so a brand
+# reconciles to one key regardless of source spelling.
+BRAND_MATCH_ALIASES = {
+    'crash out': 'crashout',
+    'ready to roll': 'roll & ready',
+}
+
 # =============================================================================
 # PAGE CONFIGURATION
 # =============================================================================
@@ -1046,12 +1058,37 @@ def load_tracked_components() -> Optional[pd.DataFrame]:
         if not os.path.exists(TRACKED_COMPONENTS_PATH):
             return None
         df = pd.read_csv(TRACKED_COMPONENTS_PATH, dtype=str).fillna('')
+        # Guarantee the expected columns exist so downstream row access never
+        # KeyErrors on an edited or older CSV.
+        for c in TRACKED_COMPONENT_COLUMNS:
+            if c not in df.columns:
+                df[c] = ''
         return df if not df.empty else None
     except Exception:
         return None
 
 
-TRACKED_COMPONENT_COLUMNS = ['distru_product', 'sku', 'haven_component', 'brand', 'pkg_type']
+def _canonical_brand_key(brand) -> str:
+    """Normalize a brand for cross-source matching: collapse whitespace,
+    lowercase, then fold known spelling variants (e.g. 'Crash Out' -> 'crashout').
+    Shared by the coverage check and the future reorder join so a brand reconciles
+    to one key whether it comes from Headset or the packaging list."""
+    b = re.sub(r'\s+', ' ', str(brand or '')).strip().lower()
+    return BRAND_MATCH_ALIASES.get(b, b)
+
+
+def _norm_sku(s) -> str:
+    """Normalize a SKU for identity: drop all whitespace, lowercase."""
+    return re.sub(r'\s+', '', str(s or '')).strip().lower()
+
+
+def _fmt_qty(v) -> str:
+    """Format a qty_per_unit for CSV/display: whole numbers as ints (1 not 1.0),
+    fractions compactly (0.1), blank or NaN as ''."""
+    n = pd.to_numeric(v, errors='coerce')
+    if pd.isna(n):
+        return ''
+    return str(int(n)) if float(n).is_integer() else ('%g' % n)
 
 
 def save_tracked_components(df: pd.DataFrame) -> bool:
@@ -1102,7 +1139,9 @@ def save_bom_map(df: pd.DataFrame) -> bool:
         for c in BOM_COLUMNS:
             if c not in out.columns:
                 out[c] = ''
-        out = out[BOM_COLUMNS].fillna('').astype(str)
+        out = out[BOM_COLUMNS].copy()
+        out['qty_per_unit'] = out['qty_per_unit'].map(_fmt_qty)
+        out = out.fillna('').astype(str)
         # A line is meaningful only if it points at a component.
         out = out[out['component_sku'].str.strip() != '']
         out.to_csv(BOM_MAP_PATH, index=False)
@@ -1182,8 +1221,9 @@ def seed_bom_map(tracked_df: pd.DataFrame) -> pd.DataFrame:
             strain = m.group(1).strip() if m else ''
 
         if role == 'master_case':
-            mcase = re.search(r'(\d+)\s*/\s*case', distru_product, re.IGNORECASE)
-            qty = round(1.0 / int(mcase.group(1)), 4) if mcase else ''
+            mcase = re.search(r'(\d+)\s*/\s*case', f'{name} {distru_product}', re.IGNORECASE)
+            cases = int(mcase.group(1)) if mcase else 0
+            qty = round(1.0 / cases, 4) if cases > 0 else ''
         else:
             qty = 1
 
@@ -1855,9 +1895,9 @@ def render_hygiene_tab(bl_df: Optional[pd.DataFrame], combined_df: Optional[pd.D
     st.header("🧼 Packaging Hygiene")
     st.caption(
         "Edit the tracked component list and the bill-of-materials that links "
-        "finished retail SKUs to the packaging they consume. Edits save to "
-        "version-controlled CSVs at the repo root. On a local run the save is "
-        "durable; to share fleet-wide, commit and push the CSV."
+        "finished retail SKUs to the packaging they consume. Saving writes the "
+        "version-controlled CSVs at the repo root. Commit and push to keep edits "
+        "across machines and deploys (an uncommitted edit only lives on this machine)."
     )
 
     tracked_df = load_tracked_components()
@@ -1871,16 +1911,13 @@ def render_hygiene_tab(bl_df: Optional[pd.DataFrame], combined_df: Optional[pd.D
     # Input Materials tab's missing-component check), shown above the editor.
     if bl_df is not None and not bl_df.empty and not tracked_df.empty:
         present_keys = {_norm_match_key(p) for p in bl_df.get('Product', pd.Series(dtype=str))}
-        present_skus = {re.sub(r'\s+', '', str(s)).strip().lower()
-                        for s in bl_df.get('SKU', pd.Series(dtype=str))}
+        present_skus = {_norm_sku(s) for s in bl_df.get('SKU', pd.Series(dtype=str))}
 
         def _tracked_present(r):
             if _norm_match_key(r['distru_product']) in present_keys:
                 return True
-            return any(
-                re.sub(r'\s+', '', part).strip().lower() in present_skus
-                for part in str(r['sku']).split(';') if part.strip()
-            )
+            return any(_norm_sku(part) in present_skus
+                       for part in str(r['sku']).split(';') if part.strip())
 
         present_mask = tracked_df.apply(_tracked_present, axis=1)
         n_present = int(present_mask.sum())
@@ -1909,7 +1946,9 @@ def render_hygiene_tab(bl_df: Optional[pd.DataFrame], combined_df: Optional[pd.D
     )
     if st.button("💾 Save component list", key="save_tracked"):
         if save_tracked_components(edited_tracked):
-            st.success("✅ Saved tracked_components.csv. Commit + push to share fleet-wide.")
+            st.session_state.pop('hygiene_bom_seed', None)
+            st.success("✅ Saved tracked_components.csv. Commit and push to keep it across machines and deploys.")
+            st.rerun()
 
     st.markdown("---")
 
@@ -1918,7 +1957,12 @@ def render_hygiene_tab(bl_df: Optional[pd.DataFrame], combined_df: Optional[pd.D
 
     bom_df = load_bom_map()
     if bom_df is None or bom_df.empty:
-        bom_df = seed_bom_map(tracked_df)
+        # Seed once and hold it stable in session_state. Regenerating the seed on
+        # every rerun would shift rows out from under the data_editor's edit diff
+        # (e.g. if the component list is edited), shuffling unsaved BOM work.
+        if 'hygiene_bom_seed' not in st.session_state:
+            st.session_state['hygiene_bom_seed'] = seed_bom_map(tracked_df)
+        bom_df = st.session_state['hygiene_bom_seed']
         if not bom_df.empty:
             st.info(
                 "No bom_map.csv yet, so this is a proposed starter mapping generated "
@@ -1969,11 +2013,13 @@ def render_hygiene_tab(bl_df: Optional[pd.DataFrame], combined_df: Optional[pd.D
     with save_col:
         if st.button("💾 Save BOM map", key="save_bom"):
             if save_bom_map(edited_bom):
-                st.success("✅ Saved bom_map.csv. Commit + push to share fleet-wide.")
+                st.session_state.pop('hygiene_bom_seed', None)
+                st.success("✅ Saved bom_map.csv. Commit and push to keep it across machines and deploys.")
+                st.rerun()
     with dl_col:
         bom_buf = io.StringIO()
         save_view = edited_bom.copy()
-        save_view['qty_per_unit'] = save_view['qty_per_unit'].fillna('')
+        save_view['qty_per_unit'] = save_view['qty_per_unit'].map(_fmt_qty)
         save_view.to_csv(bom_buf, index=False)
         st.download_button("⬇️ Download BOM map CSV", data=bom_buf.getvalue(),
                            file_name=f"bom_map_{datetime.now().strftime('%Y%m%d')}.csv",
@@ -1984,15 +2030,19 @@ def render_hygiene_tab(bl_df: Optional[pd.DataFrame], combined_df: Optional[pd.D
     # ---- Section 3: coverage check ---------------------------------------
     st.subheader("3. Coverage check")
 
-    bom_live = edited_bom[edited_bom['component_sku'].astype(str).str.strip() != ''].copy()
+    bom_live = edited_bom[edited_bom['component_sku'].fillna('').astype(str).str.strip() != ''].copy()
 
-    # Tracked components with no BOM line (matched by SKU).
+    # Tracked components with no BOM line (matched by normalized SKU, ';'-split).
     tracked_sku_set = set()
     for s in tracked_df.get('sku', pd.Series(dtype=str)):
         for part in str(s).split(';'):
             if part.strip():
-                tracked_sku_set.add(part.strip())
-    mapped_sku_set = {str(s).strip() for s in bom_live['component_sku']}
+                tracked_sku_set.add(_norm_sku(part))
+    mapped_sku_set = set()
+    for s in bom_live['component_sku']:
+        for part in str(s).split(';'):
+            if part.strip():
+                mapped_sku_set.add(_norm_sku(part))
     unmapped_skus = sorted(tracked_sku_set - mapped_sku_set)
 
     master_no_qty = bom_live[(bom_live['component_role'] == 'master_case') & (bom_live['qty_per_unit'].isna())]
@@ -2007,7 +2057,7 @@ def render_hygiene_tab(bl_df: Optional[pd.DataFrame], combined_df: Optional[pd.D
     if unmapped_skus:
         with st.expander(f"⚠️ {len(unmapped_skus)} tracked component(s) with no BOM line"):
             ref = tracked_df[tracked_df['sku'].apply(
-                lambda s: any(p.strip() in unmapped_skus for p in str(s).split(';')))]
+                lambda s: any(_norm_sku(p) in unmapped_skus for p in str(s).split(';') if p.strip()))]
             st.dataframe(
                 ref[['haven_component', 'sku', 'brand', 'pkg_type']] if not ref.empty
                 else pd.DataFrame({'sku': unmapped_skus}),
@@ -2024,21 +2074,25 @@ def render_hygiene_tab(bl_df: Optional[pd.DataFrame], combined_df: Optional[pd.D
     # Headset-side: PL brands selling with no auto BOM coverage. Brand-level
     # (robust to size-format differences); per-size coverage lands with the reorder tab.
     if combined_df is not None and not combined_df.empty and 'Brand' in combined_df.columns:
-        _brand_aliases = {'crash out': 'crashout', 'ready to roll': 'roll & ready'}
-
-        def _bnorm(b):
-            b = str(b).strip().lower()
-            return _brand_aliases.get(b, b)
-
-        selling_brands = {_bnorm(b) for b in combined_df['Brand'].dropna().unique() if str(b).strip()}
+        selling_brands = {_canonical_brand_key(b) for b in combined_df['Brand'].dropna().unique() if str(b).strip()}
         auto_bom = bom_live[bom_live['allocation'] == 'auto']
-        covered_brands = {_bnorm(b) for b in auto_bom['match_brand'] if str(b).strip()}
+        covered_brands = {_canonical_brand_key(b) for b in auto_bom['match_brand'] if str(b).strip()}
         uncovered = sorted(selling_brands - covered_brands)
+        # Inverse: auto lines whose brand never appears in the in-scope sell-through
+        # (e.g. Formula gummies, an edible filtered out of combined_df, or house
+        # labels). They look mapped but would compute zero burn, so call them out.
+        dead = sorted(b for b in covered_brands if b and b not in selling_brands)
         if uncovered:
             with st.expander(f"⚠️ {len(uncovered)} PL brand(s) selling with no auto BOM coverage"):
                 st.write(", ".join(uncovered))
-                st.caption("Brand-level check (includes brands whose packaging is not in the tracked list). "
+                st.caption("Brand-level check (includes brands whose packaging is not tracked). "
                            "Per-size reorder coverage arrives with the reorder tab.")
+        if dead:
+            with st.expander(f"⚠️ {len(dead)} mapped brand(s) with no in-scope retail sell-through (would compute zero burn)"):
+                st.write(", ".join(dead))
+                st.caption("These auto BOM lines point at brands absent from the Headset flower/preroll/vape "
+                           "sell-through (e.g. edibles like Formula gummies, or house labels). Confirm the "
+                           "brand spelling or set allocation to shared_manual.")
 
 
 def create_expandable_product_summary(df: pd.DataFrame):
@@ -2396,7 +2450,7 @@ if st.session_state.combined_data is not None or st.session_state.bl_inputs_data
         except (KeyError, ValueError):
             pass
 
-    # Create tabs. If the PL combined dataset is loaded, show the full 6-tab
+    # Create tabs. If the PL combined dataset is loaded, show the full 7-tab
     # layout. Otherwise (BL-only upload) show just the BL Input Materials tab.
     if combined_df is not None:
         tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
