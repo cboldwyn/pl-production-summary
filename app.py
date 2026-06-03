@@ -8,7 +8,7 @@ assets reports to calculate Weeks on Hand (WOH) and generate insights across
 private label and all product categories.
 
 Author: DC Retail
-Version: 4.1.1 - Brands CSV upload triggers dashboard refresh + decimal cleanup
+Version: 4.3.0 - Hygiene tab: edit tracked components + build the finished-SKU to packaging BOM map
 Date: 2026
 
 Key Features:
@@ -123,6 +123,25 @@ PL_BRAND_ALIASES = {
     'Haven Black Label': 'Black Label',
 }
 
+# Bill-of-materials map: links a finished retail SKU (matched by brand + size,
+# and strain for the per-strain Crashout jars) to the packaging component(s) it
+# consumes. Lives at the repo root (version-controlled config), mirroring
+# tracked_components.csv. Edited in the Hygiene tab; read by the reorder logic.
+BOM_MAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bom_map.csv")
+BOM_COLUMNS = ['component_sku', 'component_name', 'match_brand', 'match_size',
+               'match_strain', 'component_role', 'qty_per_unit', 'allocation', 'notes']
+BOM_ROLES = ['mylar', 'jar', 'cap', 'master_case', 'concentrate_jar', 'other']
+# auto: component burn = sum over matching finished SKUs of (daily sell-through x
+# qty_per_unit). shared_manual: component is shared across SKUs not yet fully
+# mapped, so the reorder view flags it instead of auto-splitting (e.g. White Caps
+# 50mm, generic 5oz jars) until the consuming SKUs / split rule are confirmed here.
+BOM_ALLOCATIONS = ['auto', 'shared_manual']
+# Finished retail-unit size a jar/cap pairs with, when the component name carries
+# only the physical jar size (oz/mm) rather than the retail unit size.
+JAR_BRAND_DEFAULT_SIZE = {
+    'High Five': '5g', 'Black Label Platinum': '3.5g', 'PTO': '3.5g', 'Dope St.': '14g',
+}
+
 # =============================================================================
 # PAGE CONFIGURATION
 # =============================================================================
@@ -149,7 +168,7 @@ def initialize_session_state():
             st.session_state[var] = None
 
     if st.session_state.app_version is None:
-        st.session_state.app_version = "4.2.0"
+        st.session_state.app_version = "4.3.0"
 
 initialize_session_state()
 
@@ -1031,6 +1050,171 @@ def load_tracked_components() -> Optional[pd.DataFrame]:
     except Exception:
         return None
 
+
+TRACKED_COMPONENT_COLUMNS = ['distru_product', 'sku', 'haven_component', 'brand', 'pkg_type']
+
+
+def save_tracked_components(df: pd.DataFrame) -> bool:
+    """Persist the edited tracked-components list back to the committed CSV.
+
+    Writes to TRACKED_COMPONENTS_PATH (repo root, version-controlled) and clears
+    the load cache so edits are visible immediately. On Streamlit Cloud the
+    filesystem is ephemeral, so promoting changes fleet-wide means committing the
+    CSV to git; on a local run the write is durable.
+    """
+    try:
+        out = df.copy()
+        for c in TRACKED_COMPONENT_COLUMNS:
+            if c not in out.columns:
+                out[c] = ''
+        out = out[TRACKED_COMPONENT_COLUMNS].fillna('').astype(str)
+        # Drop fully-blank rows (data_editor leaves a trailing blank when adding).
+        out = out[out.apply(lambda r: ''.join(r.values).strip() != '', axis=1)]
+        out.to_csv(TRACKED_COMPONENTS_PATH, index=False)
+        load_tracked_components.clear()
+        return True
+    except Exception as e:
+        st.warning(f"Could not save tracked components: {str(e)}")
+        return False
+
+
+@st.cache_data
+def load_bom_map() -> Optional[pd.DataFrame]:
+    """Load the finished-SKU -> packaging-component BOM map (committed config at
+    repo root). Returns None if absent so the Hygiene tab seeds a proposal."""
+    try:
+        if not os.path.exists(BOM_MAP_PATH):
+            return None
+        df = pd.read_csv(BOM_MAP_PATH, dtype=str).fillna('')
+        return df if not df.empty else None
+    except Exception:
+        return None
+
+
+def save_bom_map(df: pd.DataFrame) -> bool:
+    """Persist the BOM map to the committed CSV at repo root + clear the cache.
+
+    Same ephemeral-filesystem caveat as save_tracked_components: durable locally,
+    promote fleet-wide via a git commit.
+    """
+    try:
+        out = df.copy()
+        for c in BOM_COLUMNS:
+            if c not in out.columns:
+                out[c] = ''
+        out = out[BOM_COLUMNS].fillna('').astype(str)
+        # A line is meaningful only if it points at a component.
+        out = out[out['component_sku'].str.strip() != '']
+        out.to_csv(BOM_MAP_PATH, index=False)
+        load_bom_map.clear()
+        return True
+    except Exception as e:
+        st.warning(f"Could not save BOM map: {str(e)}")
+        return False
+
+
+def _extract_finished_size(name: str) -> str:
+    """Pull the retail unit size (e.g. 3.5g, 28g, 100mg) from a component name.
+    Returns '' when the name carries only a physical jar size (oz / mm)."""
+    matches = re.findall(r'(\d+(?:\.\d+)?)\s*(mg|g)\b', str(name), flags=re.IGNORECASE)
+    if not matches:
+        return ''
+    num, unit = matches[-1]
+    return f"{num}{unit.lower()}"
+
+
+def _infer_component_role(name: str) -> str:
+    """Infer packaging role from the component name (pkg_type is unreliable: some
+    jars are tagged 'Mylar Bag' in tracked_components)."""
+    nm = str(name).lower()
+    if 'master case' in nm:
+        return 'master_case'
+    if nm.strip().startswith('mylar'):
+        return 'mylar'
+    if 'concentrate jar' in nm:
+        return 'concentrate_jar'
+    if 'jar' in nm:          # jar wins over cap when a name has both (e.g. "Jar ... Cap")
+        return 'jar'
+    if 'cap' in nm:
+        return 'cap'
+    return 'other'
+
+
+def seed_bom_map(tracked_df: pd.DataFrame) -> pd.DataFrame:
+    """Generate a proposed BOM map from the tracked-components list.
+
+    One line per (component -> finished-SKU match key). Mylars and master cases
+    carry the finished size in their name; jars/caps fall back to a per-brand
+    default. Shared components (generic jars, White Caps, High Five 5oz jars) are
+    flagged allocation=shared_manual so the reorder view will not auto-split them
+    until the consuming SKUs / split rule are confirmed. Master-case qty_per_unit
+    is left blank unless the pack size is known (e.g. "(10/Case)" -> 0.1), which
+    surfaces it as a gap to fill. This is a STARTING PROPOSAL for human review.
+    """
+    if tracked_df is None or tracked_df.empty:
+        return pd.DataFrame(columns=BOM_COLUMNS)
+
+    rows = []
+    for _, t in tracked_df.iterrows():
+        name = str(t.get('haven_component') or t.get('distru_product') or '').strip()
+        distru_product = str(t.get('distru_product') or '')
+        sku = str(t.get('sku') or '').strip()
+        if not sku and not name:
+            continue
+
+        role = _infer_component_role(name)
+
+        # Brand: prefer name-derived canonical (handles brand-column mislabels,
+        # e.g. the Black Label master case tagged "Dope St."); fall back to the
+        # brand column, treating "Generic"/blank as no brand.
+        brand = extract_pl_brand_from_name(name) or ''
+        if not brand:
+            b = str(t.get('brand') or '').strip()
+            brand = '' if b.lower() in ('', 'generic') else b
+
+        size = _extract_finished_size(name)
+        if not size and role in ('jar', 'cap'):
+            size = JAR_BRAND_DEFAULT_SIZE.get(brand, '')
+
+        strain = ''
+        if role == 'concentrate_jar':
+            m = re.search(r'-\s*(.+?)\s+\d', name)   # "... - Black Jack  1g"
+            strain = m.group(1).strip() if m else ''
+
+        if role == 'master_case':
+            mcase = re.search(r'(\d+)\s*/\s*case', distru_product, re.IGNORECASE)
+            qty = round(1.0 / int(mcase.group(1)), 4) if mcase else ''
+        else:
+            qty = 1
+
+        name_l = name.lower()
+        is_generic = (not brand) or 'no cap' in name_l or str(t.get('brand') or '').strip().lower() == 'generic'
+        is_high_five_jar = (brand == 'High Five' and role == 'jar')  # multiple 5oz entries; confirm current
+        shared = (role == 'cap') or is_generic or is_high_five_jar
+        allocation = 'shared_manual' if shared else 'auto'
+
+        note = []
+        if role == 'master_case' and qty == '':
+            note.append('set units-per-case')
+        if shared:
+            note.append('shared component - confirm consuming SKUs / split')
+        if not brand:
+            note.append('no brand match - set match_brand')
+
+        rows.append({
+            'component_sku': sku,
+            'component_name': name,
+            'match_brand': brand,
+            'match_size': size,
+            'match_strain': strain,
+            'component_role': role,
+            'qty_per_unit': qty,
+            'allocation': allocation,
+            'notes': '; '.join(note),
+        })
+
+    return pd.DataFrame(rows, columns=BOM_COLUMNS)
+
 # =============================================================================
 # DATA PROCESSING FUNCTIONS
 # =============================================================================
@@ -1656,6 +1840,207 @@ def render_bl_inputs_tab(df: Optional[pd.DataFrame], meta: Optional[dict] = None
     )
 
 
+def render_hygiene_tab(bl_df: Optional[pd.DataFrame], combined_df: Optional[pd.DataFrame] = None):
+    """
+    Render the Packaging Hygiene tab.
+
+    Maintenance surface for the packaging tracker, kept separate from the clean
+    reorder view. Two editors: (1) the tracked-component list (the packaging SKUs
+    Haven reorders) and (2) the bill-of-materials linking finished retail SKUs to
+    the components they consume. Both persist to version-controlled CSVs at the
+    repo root. A coverage check surfaces unmapped components, master cases missing
+    a pack size, shared components awaiting a split rule, and PL brands selling
+    with no packaging mapped.
+    """
+    st.header("🧼 Packaging Hygiene")
+    st.caption(
+        "Edit the tracked component list and the bill-of-materials that links "
+        "finished retail SKUs to the packaging they consume. Edits save to "
+        "version-controlled CSVs at the repo root. On a local run the save is "
+        "durable; to share fleet-wide, commit and push the CSV."
+    )
+
+    tracked_df = load_tracked_components()
+    if tracked_df is None:
+        tracked_df = pd.DataFrame(columns=TRACKED_COMPONENT_COLUMNS)
+
+    # ---- Section 1: tracked component list -------------------------------
+    st.subheader("1. Tracked components")
+
+    # Read-only "present in latest Beyond Legends upload" status (mirrors the
+    # Input Materials tab's missing-component check), shown above the editor.
+    if bl_df is not None and not bl_df.empty and not tracked_df.empty:
+        present_keys = {_norm_match_key(p) for p in bl_df.get('Product', pd.Series(dtype=str))}
+        present_skus = {re.sub(r'\s+', '', str(s)).strip().lower()
+                        for s in bl_df.get('SKU', pd.Series(dtype=str))}
+
+        def _tracked_present(r):
+            if _norm_match_key(r['distru_product']) in present_keys:
+                return True
+            return any(
+                re.sub(r'\s+', '', part).strip().lower() in present_skus
+                for part in str(r['sku']).split(';') if part.strip()
+            )
+
+        present_mask = tracked_df.apply(_tracked_present, axis=1)
+        n_present = int(present_mask.sum())
+        c1, c2 = st.columns(2)
+        c1.metric("Tracked components", f"{len(tracked_df)}")
+        c2.metric("In latest BL upload", f"{n_present} of {len(tracked_df)}")
+        missing = tracked_df[~present_mask]
+        if not missing.empty:
+            with st.expander(f"⚠️ {len(missing)} tracked component(s) not in the latest Beyond Legends upload"):
+                st.dataframe(missing[['haven_component', 'brand', 'pkg_type', 'sku']],
+                             hide_index=True, use_container_width=True)
+    else:
+        st.metric("Tracked components", f"{len(tracked_df)}")
+        st.caption("Upload the Beyond Legends Distru CSV in the sidebar to check which tracked components are in the current on-hand export.")
+
+    edited_tracked = st.data_editor(
+        tracked_df, num_rows="dynamic", use_container_width=True, height=420,
+        key="hygiene_tracked",
+        column_config={
+            'distru_product': st.column_config.TextColumn('distru_product', help="Exact Distru product name (the match key to on-hand)."),
+            'sku': st.column_config.TextColumn('sku', help="Distru SKU. Semicolon-separate if one component has several."),
+            'haven_component': st.column_config.TextColumn('haven_component', help="Human-readable label."),
+            'brand': st.column_config.TextColumn('brand'),
+            'pkg_type': st.column_config.TextColumn('pkg_type', help="e.g. Mylar Bag, Master Case."),
+        },
+    )
+    if st.button("💾 Save component list", key="save_tracked"):
+        if save_tracked_components(edited_tracked):
+            st.success("✅ Saved tracked_components.csv. Commit + push to share fleet-wide.")
+
+    st.markdown("---")
+
+    # ---- Section 2: bill of materials ------------------------------------
+    st.subheader("2. Bill of materials (finished SKU to component)")
+
+    bom_df = load_bom_map()
+    if bom_df is None or bom_df.empty:
+        bom_df = seed_bom_map(tracked_df)
+        if not bom_df.empty:
+            st.info(
+                "No bom_map.csv yet, so this is a proposed starter mapping generated "
+                "from the tracked components. Review the flagged rows (shared components "
+                "and master-case quantities in particular), then Save to create the file."
+            )
+
+    st.markdown(
+        "**qty_per_unit** = component units consumed per one finished retail unit "
+        "(a master case of N units = 1/N, e.g. 10/case = 0.1). "
+        "**allocation**: `auto` means burn = sum of matching SKU sell-through times "
+        "qty_per_unit; `shared_manual` means the component is shared across SKUs not "
+        "yet fully mapped, so the reorder view flags it instead of auto-splitting. "
+        "Flip White Caps and shared jars to `auto` once their consuming SKUs are confirmed."
+    )
+
+    # qty_per_unit must be numeric for the NumberColumn editor (load reads strings).
+    bom_df = bom_df.copy()
+    bom_df['qty_per_unit'] = pd.to_numeric(bom_df.get('qty_per_unit'), errors='coerce')
+
+    sku_options = sorted(set(
+        [str(s).strip() for s in tracked_df.get('sku', pd.Series(dtype=str)) if str(s).strip()]
+        + [str(s).strip() for s in bom_df.get('component_sku', pd.Series(dtype=str)) if str(s).strip()]
+    ))
+
+    sku_col = (st.column_config.SelectboxColumn('component_sku', options=sku_options,
+                                                help="Component this line consumes (the tracked-component SKU).")
+               if sku_options else
+               st.column_config.TextColumn('component_sku', help="Component this line consumes (the tracked-component SKU)."))
+
+    edited_bom = st.data_editor(
+        bom_df, num_rows="dynamic", use_container_width=True, height=520,
+        key="hygiene_bom",
+        column_config={
+            'component_sku': sku_col,
+            'component_name': st.column_config.TextColumn('component_name'),
+            'match_brand': st.column_config.TextColumn('match_brand', help="Brand to match in Headset sell-through (case-insensitive)."),
+            'match_size': st.column_config.TextColumn('match_size', help="Finished unit size, e.g. 3.5g. Blank = any size of the brand."),
+            'match_strain': st.column_config.TextColumn('match_strain', help="Only for per-strain components (Crashout jars). Blank = all strains."),
+            'component_role': st.column_config.SelectboxColumn('component_role', options=BOM_ROLES),
+            'qty_per_unit': st.column_config.NumberColumn('qty_per_unit', format="%.4f", min_value=0.0, help="Components per one finished unit. Master case = 1/units-per-case."),
+            'allocation': st.column_config.SelectboxColumn('allocation', options=BOM_ALLOCATIONS),
+            'notes': st.column_config.TextColumn('notes'),
+        },
+    )
+
+    save_col, dl_col = st.columns([1, 1])
+    with save_col:
+        if st.button("💾 Save BOM map", key="save_bom"):
+            if save_bom_map(edited_bom):
+                st.success("✅ Saved bom_map.csv. Commit + push to share fleet-wide.")
+    with dl_col:
+        bom_buf = io.StringIO()
+        save_view = edited_bom.copy()
+        save_view['qty_per_unit'] = save_view['qty_per_unit'].fillna('')
+        save_view.to_csv(bom_buf, index=False)
+        st.download_button("⬇️ Download BOM map CSV", data=bom_buf.getvalue(),
+                           file_name=f"bom_map_{datetime.now().strftime('%Y%m%d')}.csv",
+                           mime="text/csv", key="bom_download")
+
+    st.markdown("---")
+
+    # ---- Section 3: coverage check ---------------------------------------
+    st.subheader("3. Coverage check")
+
+    bom_live = edited_bom[edited_bom['component_sku'].astype(str).str.strip() != ''].copy()
+
+    # Tracked components with no BOM line (matched by SKU).
+    tracked_sku_set = set()
+    for s in tracked_df.get('sku', pd.Series(dtype=str)):
+        for part in str(s).split(';'):
+            if part.strip():
+                tracked_sku_set.add(part.strip())
+    mapped_sku_set = {str(s).strip() for s in bom_live['component_sku']}
+    unmapped_skus = sorted(tracked_sku_set - mapped_sku_set)
+
+    master_no_qty = bom_live[(bom_live['component_role'] == 'master_case') & (bom_live['qty_per_unit'].isna())]
+    shared_rows = bom_live[bom_live['allocation'] == 'shared_manual']
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("BOM lines", f"{len(bom_live)}")
+    m2.metric("Unmapped components", f"{len(unmapped_skus)}")
+    m3.metric("Master cases missing qty", f"{len(master_no_qty)}")
+    m4.metric("Shared (manual)", f"{len(shared_rows)}")
+
+    if unmapped_skus:
+        with st.expander(f"⚠️ {len(unmapped_skus)} tracked component(s) with no BOM line"):
+            ref = tracked_df[tracked_df['sku'].apply(
+                lambda s: any(p.strip() in unmapped_skus for p in str(s).split(';')))]
+            st.dataframe(
+                ref[['haven_component', 'sku', 'brand', 'pkg_type']] if not ref.empty
+                else pd.DataFrame({'sku': unmapped_skus}),
+                hide_index=True, use_container_width=True)
+    if not master_no_qty.empty:
+        with st.expander(f"⚠️ {len(master_no_qty)} master case(s) missing units-per-case"):
+            st.dataframe(master_no_qty[['component_sku', 'component_name', 'match_brand', 'match_size']],
+                         hide_index=True, use_container_width=True)
+    if not shared_rows.empty:
+        with st.expander(f"ℹ️ {len(shared_rows)} shared component(s) set to manual (not auto-split)"):
+            st.dataframe(shared_rows[['component_sku', 'component_name', 'match_brand', 'match_size', 'notes']],
+                         hide_index=True, use_container_width=True)
+
+    # Headset-side: PL brands selling with no auto BOM coverage. Brand-level
+    # (robust to size-format differences); per-size coverage lands with the reorder tab.
+    if combined_df is not None and not combined_df.empty and 'Brand' in combined_df.columns:
+        _brand_aliases = {'crash out': 'crashout', 'ready to roll': 'roll & ready'}
+
+        def _bnorm(b):
+            b = str(b).strip().lower()
+            return _brand_aliases.get(b, b)
+
+        selling_brands = {_bnorm(b) for b in combined_df['Brand'].dropna().unique() if str(b).strip()}
+        auto_bom = bom_live[bom_live['allocation'] == 'auto']
+        covered_brands = {_bnorm(b) for b in auto_bom['match_brand'] if str(b).strip()}
+        uncovered = sorted(selling_brands - covered_brands)
+        if uncovered:
+            with st.expander(f"⚠️ {len(uncovered)} PL brand(s) selling with no auto BOM coverage"):
+                st.write(", ".join(uncovered))
+                st.caption("Brand-level check (includes brands whose packaging is not in the tracked list). "
+                           "Per-size reorder coverage arrives with the reorder tab.")
+
+
 def create_expandable_product_summary(df: pd.DataFrame):
     """Create expandable product summary with drill-down by category, with Vape breakdown by keywords"""
     
@@ -2014,13 +2399,14 @@ if st.session_state.combined_data is not None or st.session_state.bl_inputs_data
     # Create tabs. If the PL combined dataset is loaded, show the full 6-tab
     # layout. Otherwise (BL-only upload) show just the BL Input Materials tab.
     if combined_df is not None:
-        tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
             "🚨 Private Label Production Alerts",
             "📊 Private Label Performance & Stock Dashboard",
             "🎯 Product Analysis",
             "📦 Distru Stock",
             "🧰 Input Materials (BL)",
-            "📋 Raw Data"
+            "📋 Raw Data",
+            "🧼 Hygiene"
         ])
     else:
         (bl_only_tab,) = st.tabs(["🧰 Input Materials (BL)"])
@@ -2557,6 +2943,9 @@ if st.session_state.combined_data is not None or st.session_state.bl_inputs_data
             display_raw_df = combined_df
         
         st.dataframe(format_dataframe(display_raw_df), use_container_width=True, height=600)
+
+    with tab6:
+        render_hygiene_tab(st.session_state.bl_inputs_data, combined_df)
 
 else:
     # Welcome screen
