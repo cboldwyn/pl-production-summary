@@ -755,18 +755,19 @@ def style_flag_dataframe(df: pd.DataFrame, flag_column: str = 'Flag'):
     format_dict = _number_format_dict(df)
     styled = df.style.apply(apply_row_style, axis=1)
     if format_dict:
-        styled = styled.format(format_dict)
+        # na_rep='' so NaN / Int64 <NA> cells render blank, not 'nan' / '<NA>'.
+        styled = styled.format(format_dict, na_rep='')
     return styled
 
 
 # Columns that should always render with 1 decimal (rates of sale, weeks).
-_RATE_COLS = frozenset({'Daily Sales', 'WOH', 'In Stock Avg Units per Day'})
+_RATE_COLS = frozenset({'Daily Sales', 'WOH', 'In Stock Avg Units per Day', 'Daily Burn'})
 # Columns that should always render as integers with thousands separators
 # (unit counts, store counts, day counts).
 _COUNT_COLS = frozenset({
     'Total Inventory', 'Distru Quantity', 'Store Count',
     'Total Products', 'Distro Products', 'Total Store Presence',
-    'Distru Days Supply',
+    'Distru Days Supply', 'On Hand', 'Suggested Order',
 })
 
 
@@ -1081,8 +1082,10 @@ def _canonical_brand_key(brand) -> str:
 
 
 def _norm_sku(s) -> str:
-    """Normalize a SKU for identity: drop all whitespace, lowercase."""
-    return re.sub(r'\s+', '', str(s or '')).strip().lower()
+    """Normalize a SKU for identity: collapse whitespace to single spaces and
+    lowercase. Do NOT drop internal spaces: some real SKUs differ only by a stray
+    space (e.g. the three Cloud9ne mylars), and must not collapse into one bucket."""
+    return re.sub(r'\s+', ' ', str(s or '')).strip().lower()
 
 
 def _norm_size(s) -> str:
@@ -2147,23 +2150,39 @@ def compute_component_reorder(bom_df: Optional[pd.DataFrame], bl_df: Optional[pd
             '_burn': pd.to_numeric(sales_df.get('In Stock Avg Units per Day'), errors='coerce').fillna(0.0),
         })
 
+    # True variant components (same brand+size+strain AND same role, e.g. the three
+    # Cloud9ne strain-variant mylars seeded with blank strain) each match the same
+    # finished SKUs and are alternatives, so split that sell-through evenly across
+    # them. Different roles for the same brand+size (a jar AND a master case) are
+    # complementary, both consumed, so role is part of the key and they do NOT split.
+    key_components = {}
+    for _, line in bom[bom['allocation'] == 'auto'].iterrows():
+        k = (_canonical_brand_key(line.get('match_brand', '')),
+             _norm_size(line.get('match_size', '')),
+             str(line.get('match_strain', '') or '').strip().lower(),
+             str(line.get('component_role', '') or '').strip().lower())
+        key_components.setdefault(k, set()).add(str(line.get('component_sku', '')).strip())
+    key_share = {k: max(1, len(v)) for k, v in key_components.items()}
+
     def _line_burn(line):
         if sales is None:
-            return 0.0, 0
+            return 0.0, 0, 1
         bkey = _canonical_brand_key(line.get('match_brand', ''))
         if not bkey:
-            return 0.0, 0
-        m = sales['_bkey'] == bkey
+            return 0.0, 0, 1
         size = _norm_size(line.get('match_size', ''))
+        strain = str(line.get('match_strain', '') or '').strip().lower()
+        role = str(line.get('component_role', '') or '').strip().lower()
+        share = key_share.get((bkey, size, strain, role), 1)
+        m = sales['_bkey'] == bkey
         if size:
             m = m & (sales['_size'] == size)
-        strain = str(line.get('match_strain', '') or '').strip().lower()
         if strain:
             m = m & sales['_pname'].str.contains(re.escape(strain), na=False)
         matched = sales[m]
         qpu = line.get('qty_per_unit')
         qpu = 0.0 if pd.isna(qpu) else float(qpu)
-        return float(matched['_burn'].sum()) * qpu, int(len(matched))
+        return float(matched['_burn'].sum()) * qpu / share, int(len(matched)), share
 
     target_days = float(target_weeks) * 7.0
     rows = []
@@ -2177,18 +2196,24 @@ def compute_component_reorder(bom_df: Optional[pd.DataFrame], bl_df: Optional[pd
 
         auto_lines = grp[grp['allocation'] == 'auto']
         has_shared = bool((grp['allocation'] == 'shared_manual').any())
-        daily_burn, matched_skus = 0.0, 0
+        daily_burn, matched_skus, max_share = 0.0, 0, 1
         for _, line in auto_lines.iterrows():
-            b, n = _line_burn(line)
+            b, n, share = _line_burn(line)
             daily_burn += b
             matched_skus += n
+            max_share = max(max_share, share)
 
-        woh = calculate_woh(on_hand_val, daily_burn) if on_hand_known else float('nan')
-        suggested = max(0.0, daily_burn * target_days - on_hand_val) if daily_burn >= MIN_DAILY_SALES else 0.0
+        has_burn = daily_burn >= MIN_DAILY_SALES
+        woh = calculate_woh(on_hand_val, daily_burn) if (on_hand_known and has_burn) else float('nan')
+        if on_hand_known and has_burn:
+            suggested = float(max(0.0, daily_burn * target_days - on_hand_val))
+        else:
+            # No defensible order without BOTH known stock and a real burn signal.
+            suggested = float('nan')
 
         if not on_hand_known:
             flag = 'no-onhand'
-        elif daily_burn >= MIN_DAILY_SALES:
+        elif has_burn:
             flag = ('critical' if woh <= WOH_CRITICAL else
                     'urgent' if woh <= WOH_URGENT else
                     'warning' if woh <= WOH_WARNING else 'ok')
@@ -2197,14 +2222,23 @@ def compute_component_reorder(bom_df: Optional[pd.DataFrame], bl_df: Optional[pd
         else:
             flag = 'no-sales'
 
+        if auto_lines.empty and has_shared:
+            allocation = 'shared/manual'
+        elif not auto_lines.empty and has_shared:
+            allocation = 'mixed'
+        elif max_share > 1:
+            allocation = f'auto (1/{max_share})'
+        else:
+            allocation = 'auto'
+
         rows.append({
             'Component': name,
             'SKU': str(sku),
-            'Allocation': 'shared/manual' if (auto_lines.empty and has_shared) else 'auto',
+            'Allocation': allocation,
             'On Hand': on_hand_val if on_hand_known else float('nan'),
             'Daily Burn': round(daily_burn, 2),
             'WOH': woh,
-            'Suggested Order': int(round(suggested)),
+            'Suggested Order': round(suggested) if pd.notna(suggested) else float('nan'),
             'Matched SKUs': matched_skus,
             'Flag': flag,
         })
@@ -2238,18 +2272,17 @@ def render_reorder_tab(bl_df: Optional[pd.DataFrame], combined_df: Optional[pd.D
         return
 
     reorder_now = result[result['Flag'].isin(['critical', 'urgent'])]
-    no_data = result[result['Flag'].isin(['manual', 'no-sales', 'no-onhand'])]
+    stock_unknown = result[(result['Flag'] == 'no-onhand') & (result['Daily Burn'] >= MIN_DAILY_SALES)]
+    total_suggested = result['Suggested Order'].sum(skipna=True)
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Components", f"{len(result)}")
-    c2.metric("Reorder now (WOH <= 4)", f"{len(reorder_now)}")
-    c3.metric("Suggested order (units)", f"{int(result['Suggested Order'].sum()):,}")
-    c4.metric("Manual / no-data", f"{len(no_data)}")
+    c2.metric(f"Reorder now (WOH <= {WOH_URGENT})", f"{len(reorder_now)}")
+    c3.metric("Stock unknown, has burn", f"{len(stock_unknown)}")
+    c4.metric("Suggested order (units)", f"{int(total_suggested):,}")
 
     st.markdown("---")
 
     disp = result.sort_values('WOH', ascending=True, na_position='last').copy()
-    # Whole-unit display for on-hand (nullable int so unknown shows as blank).
-    disp['On Hand'] = disp['On Hand'].round().astype('Int64')
     display_cols = ['Component', 'SKU', 'Allocation', 'On Hand', 'Daily Burn', 'WOH',
                     'Suggested Order', 'Matched SKUs', 'Flag']
     st.dataframe(style_flag_dataframe(disp[display_cols], 'Flag'),
@@ -2257,8 +2290,9 @@ def render_reorder_tab(bl_df: Optional[pd.DataFrame], combined_df: Optional[pd.D
     st.caption(
         f"Flags: critical (WOH <= {WOH_CRITICAL}), urgent (<= {WOH_URGENT}), warning (<= {WOH_WARNING}), ok. "
         "manual = shared component, set the split in Hygiene. no-sales = no matching retail sell-through. "
-        "no-onhand = component not found in the Beyond Legends upload. "
-        f"Suggested order = daily burn x {int(target_weeks)} weeks minus on-hand."
+        "no-onhand = not in the Beyond Legends upload (on-hand unknown, so no suggested order). "
+        "'auto (1/N)' = sell-through split across N variant components sharing a match key. "
+        f"Suggested order (known-stock rows) = daily burn x {int(target_weeks)} weeks minus on-hand."
     )
 
     buf = io.StringIO()
