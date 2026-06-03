@@ -8,7 +8,7 @@ assets reports to calculate Weeks on Hand (WOH) and generate insights across
 private label and all product categories.
 
 Author: DC Retail
-Version: 4.3.0 - Hygiene tab: edit tracked components + build the finished-SKU to packaging BOM map
+Version: 4.4.0 - Packaging Reorder tab: per-component burn, weeks-on-hand, and suggested order from the BOM
 Date: 2026
 
 Key Features:
@@ -154,6 +154,9 @@ BRAND_MATCH_ALIASES = {
     'ready to roll': 'roll & ready',
 }
 
+# Default weeks-of-cover target for the packaging reorder suggestion.
+DEFAULT_TARGET_WEEKS = 12
+
 # =============================================================================
 # PAGE CONFIGURATION
 # =============================================================================
@@ -180,7 +183,7 @@ def initialize_session_state():
             st.session_state[var] = None
 
     if st.session_state.app_version is None:
-        st.session_state.app_version = "4.3.0"
+        st.session_state.app_version = "4.4.0"
 
 initialize_session_state()
 
@@ -1079,6 +1082,11 @@ def _canonical_brand_key(brand) -> str:
 
 def _norm_sku(s) -> str:
     """Normalize a SKU for identity: drop all whitespace, lowercase."""
+    return re.sub(r'\s+', '', str(s or '')).strip().lower()
+
+
+def _norm_size(s) -> str:
+    """Normalize a size token for matching (e.g. '3.5G ' -> '3.5g')."""
     return re.sub(r'\s+', '', str(s or '')).strip().lower()
 
 
@@ -2095,6 +2103,171 @@ def render_hygiene_tab(bl_df: Optional[pd.DataFrame], combined_df: Optional[pd.D
                            "brand spelling or set allocation to shared_manual.")
 
 
+def compute_component_reorder(bom_df: Optional[pd.DataFrame], bl_df: Optional[pd.DataFrame],
+                              sales_df: Optional[pd.DataFrame], target_weeks: float) -> pd.DataFrame:
+    """Per-component packaging reorder calc.
+
+    For each component in the saved BOM map, joins on-hand (Beyond Legends Distru
+    Active Quantity) with the daily burn implied by the finished-SKU sell-through
+    of the products that consume it. Burn for an `auto` BOM line = sum over the
+    matching finished SKUs of (daily sell-through x qty_per_unit); `shared_manual`
+    lines are flagged, not auto-summed. Weeks-on-hand reuses calculate_woh; the
+    suggested order brings the component up to target_weeks of cover.
+    """
+    if bom_df is None or bom_df.empty:
+        return pd.DataFrame()
+    bom = bom_df.copy()
+    bom['component_sku'] = bom['component_sku'].fillna('').astype(str)
+    bom = bom[bom['component_sku'].str.strip() != '']
+    if bom.empty:
+        return pd.DataFrame()
+    bom['qty_per_unit'] = pd.to_numeric(bom.get('qty_per_unit'), errors='coerce')
+    bom['allocation'] = bom.get('allocation', '').fillna('').astype(str)
+
+    # On-hand lookup by normalized SKU, with a product-name fallback.
+    onhand_by_sku, onhand_by_name = {}, {}
+    if bl_df is not None and not bl_df.empty:
+        for _, r in bl_df.iterrows():
+            q = pd.to_numeric(r.get('Active Quantity'), errors='coerce')
+            q = 0.0 if pd.isna(q) else float(q)
+            sk = _norm_sku(r.get('SKU', ''))
+            nm = _norm_match_key(r.get('Product', ''))
+            if sk:
+                onhand_by_sku[sk] = onhand_by_sku.get(sk, 0.0) + q
+            if nm:
+                onhand_by_name[nm] = onhand_by_name.get(nm, 0.0) + q
+
+    # Pre-extract sell-through match keys once.
+    sales = None
+    if sales_df is not None and not sales_df.empty and 'Brand' in sales_df.columns:
+        sales = pd.DataFrame({
+            '_bkey': sales_df['Brand'].map(_canonical_brand_key),
+            '_size': sales_df.get('Weight', pd.Series('', index=sales_df.index)).map(_norm_size),
+            '_pname': sales_df.get('Product Name', pd.Series('', index=sales_df.index)).astype(str).str.lower(),
+            '_burn': pd.to_numeric(sales_df.get('In Stock Avg Units per Day'), errors='coerce').fillna(0.0),
+        })
+
+    def _line_burn(line):
+        if sales is None:
+            return 0.0, 0
+        bkey = _canonical_brand_key(line.get('match_brand', ''))
+        if not bkey:
+            return 0.0, 0
+        m = sales['_bkey'] == bkey
+        size = _norm_size(line.get('match_size', ''))
+        if size:
+            m = m & (sales['_size'] == size)
+        strain = str(line.get('match_strain', '') or '').strip().lower()
+        if strain:
+            m = m & sales['_pname'].str.contains(re.escape(strain), na=False)
+        matched = sales[m]
+        qpu = line.get('qty_per_unit')
+        qpu = 0.0 if pd.isna(qpu) else float(qpu)
+        return float(matched['_burn'].sum()) * qpu, int(len(matched))
+
+    target_days = float(target_weeks) * 7.0
+    rows = []
+    for sku, grp in bom.groupby('component_sku'):
+        name = next((str(n) for n in grp['component_name'] if str(n).strip()), str(sku))
+        on_hand = onhand_by_sku.get(_norm_sku(sku))
+        if on_hand is None:
+            on_hand = onhand_by_name.get(_norm_match_key(name))
+        on_hand_known = on_hand is not None
+        on_hand_val = float(on_hand or 0.0)
+
+        auto_lines = grp[grp['allocation'] == 'auto']
+        has_shared = bool((grp['allocation'] == 'shared_manual').any())
+        daily_burn, matched_skus = 0.0, 0
+        for _, line in auto_lines.iterrows():
+            b, n = _line_burn(line)
+            daily_burn += b
+            matched_skus += n
+
+        woh = calculate_woh(on_hand_val, daily_burn) if on_hand_known else float('nan')
+        suggested = max(0.0, daily_burn * target_days - on_hand_val) if daily_burn >= MIN_DAILY_SALES else 0.0
+
+        if not on_hand_known:
+            flag = 'no-onhand'
+        elif daily_burn >= MIN_DAILY_SALES:
+            flag = ('critical' if woh <= WOH_CRITICAL else
+                    'urgent' if woh <= WOH_URGENT else
+                    'warning' if woh <= WOH_WARNING else 'ok')
+        elif auto_lines.empty and has_shared:
+            flag = 'manual'
+        else:
+            flag = 'no-sales'
+
+        rows.append({
+            'Component': name,
+            'SKU': str(sku),
+            'Allocation': 'shared/manual' if (auto_lines.empty and has_shared) else 'auto',
+            'On Hand': on_hand_val if on_hand_known else float('nan'),
+            'Daily Burn': round(daily_burn, 2),
+            'WOH': woh,
+            'Suggested Order': int(round(suggested)),
+            'Matched SKUs': matched_skus,
+            'Flag': flag,
+        })
+    return pd.DataFrame(rows)
+
+
+def render_reorder_tab(bl_df: Optional[pd.DataFrame], combined_df: Optional[pd.DataFrame]):
+    """Packaging reorder view: per-component on-hand, daily burn (BOM x finished-SKU
+    sell-through), weeks-on-hand, and a suggested order to a target cover. Reads the
+    SAVED bom_map.csv, so build it in the Hygiene tab first."""
+    st.header("🔄 Packaging Reorder")
+
+    bom_df = load_bom_map()
+    if bom_df is None or bom_df.empty:
+        st.info("No BOM map yet. Build and Save the bill-of-materials in the 🧼 Hygiene tab first; "
+                "the reorder view is computed from it.")
+        return
+    if bl_df is None or bl_df.empty:
+        st.warning("On-hand is unknown until you upload the Beyond Legends Distru CSV in the sidebar. "
+                   "Burn and weeks-on-hand still compute from sell-through.")
+
+    target_weeks = st.number_input(
+        "Target weeks of cover", min_value=1, max_value=52, value=DEFAULT_TARGET_WEEKS, step=1,
+        help="The suggested order brings each component up to this many weeks of cover at its current burn.",
+        key="reorder_target_weeks",
+    )
+
+    result = compute_component_reorder(bom_df, bl_df, combined_df, target_weeks)
+    if result.empty:
+        st.info("No mapped components to compute. Add BOM lines in the Hygiene tab.")
+        return
+
+    reorder_now = result[result['Flag'].isin(['critical', 'urgent'])]
+    no_data = result[result['Flag'].isin(['manual', 'no-sales', 'no-onhand'])]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Components", f"{len(result)}")
+    c2.metric("Reorder now (WOH <= 4)", f"{len(reorder_now)}")
+    c3.metric("Suggested order (units)", f"{int(result['Suggested Order'].sum()):,}")
+    c4.metric("Manual / no-data", f"{len(no_data)}")
+
+    st.markdown("---")
+
+    disp = result.sort_values('WOH', ascending=True, na_position='last').copy()
+    # Whole-unit display for on-hand (nullable int so unknown shows as blank).
+    disp['On Hand'] = disp['On Hand'].round().astype('Int64')
+    display_cols = ['Component', 'SKU', 'Allocation', 'On Hand', 'Daily Burn', 'WOH',
+                    'Suggested Order', 'Matched SKUs', 'Flag']
+    st.dataframe(style_flag_dataframe(disp[display_cols], 'Flag'),
+                 use_container_width=True, hide_index=True, height=600)
+    st.caption(
+        f"Flags: critical (WOH <= {WOH_CRITICAL}), urgent (<= {WOH_URGENT}), warning (<= {WOH_WARNING}), ok. "
+        "manual = shared component, set the split in Hygiene. no-sales = no matching retail sell-through. "
+        "no-onhand = component not found in the Beyond Legends upload. "
+        f"Suggested order = daily burn x {int(target_weeks)} weeks minus on-hand."
+    )
+
+    buf = io.StringIO()
+    disp[display_cols].to_csv(buf, index=False)
+    st.download_button("⬇️ Download reorder CSV", data=buf.getvalue(),
+                       file_name=f"packaging_reorder_{datetime.now().strftime('%Y%m%d')}.csv",
+                       mime="text/csv", key="reorder_download")
+
+
 def create_expandable_product_summary(df: pd.DataFrame):
     """Create expandable product summary with drill-down by category, with Vape breakdown by keywords"""
     
@@ -2453,14 +2626,15 @@ if st.session_state.combined_data is not None or st.session_state.bl_inputs_data
     # Create tabs. If the PL combined dataset is loaded, show the full 7-tab
     # layout. Otherwise (BL-only upload) show just the BL Input Materials tab.
     if combined_df is not None:
-        tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
             "🚨 Private Label Production Alerts",
             "📊 Private Label Performance & Stock Dashboard",
             "🎯 Product Analysis",
             "📦 Distru Stock",
             "🧰 Input Materials (BL)",
             "📋 Raw Data",
-            "🧼 Hygiene"
+            "🧼 Hygiene",
+            "🔄 Packaging Reorder"
         ])
     else:
         (bl_only_tab,) = st.tabs(["🧰 Input Materials (BL)"])
@@ -3000,6 +3174,9 @@ if st.session_state.combined_data is not None or st.session_state.bl_inputs_data
 
     with tab6:
         render_hygiene_tab(st.session_state.bl_inputs_data, combined_df)
+
+    with tab7:
+        render_reorder_tab(st.session_state.bl_inputs_data, combined_df)
 
 else:
     # Welcome screen
