@@ -8,7 +8,7 @@ assets reports to calculate Weeks on Hand (WOH) and generate insights across
 private label and all product categories.
 
 Author: DC Retail
-Version: 4.4.0 - Packaging Reorder tab: per-component burn, weeks-on-hand, and suggested order from the BOM
+Version: 5.0.0 - product-centric BOM: product types carry units_per_case, ingredients hang off them (no variant split)
 Date: 2026
 
 Key Features:
@@ -123,26 +123,37 @@ PL_BRAND_ALIASES = {
     'Haven Black Label': 'Black Label',
 }
 
-# Bill-of-materials map: links a finished retail SKU (matched by brand + size,
-# and strain for the per-strain Crashout jars) to the packaging component(s) it
-# consumes. Lives at the repo root (version-controlled config), mirroring
-# tracked_components.csv. Edited in the Hygiene tab; read by the reorder logic.
+# Product-centric bill of materials (v5 model). A *product type* is the finished
+# retail product at the grain where its packaging is constant (e.g. "Black Label
+# 3.5g", or "Cloud9ne 3.5g Hybrid" where the mylar differs by category). The
+# product type carries units_per_case; the components it consumes ("ingredients")
+# hang off it in the BOM. This dissolves the old component-centric fuzzy matching:
+# each product explicitly lists its components, so there is no sell-through to
+# split across variant mylars and no SKU-collision double-count.
+#
+# product_types.csv: one row per product type (match_brand/size/variant identify
+# the Headset sell-through it consumes; units_per_case is its case quantity).
+PRODUCT_TYPES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "product_types.csv")
+PRODUCT_TYPE_COLUMNS = ['product_type', 'match_brand', 'match_size', 'match_variant',
+                        'units_per_case', 'notes']
+# bom_map.csv: one row per (product_type, ingredient component) it consumes. There
+# is no quantity column: every ingredient is one-per-unit (a product uses one mylar,
+# one jar, one cap), and the only "N per" relationship - the master case - is derived
+# from the product type's units_per_case (1/N) at compute time. A component shared by
+# several products (a shared master case or cap) appears once per product type, and
+# its total burn is the SUM across those products - explicit, no heuristic split.
 BOM_MAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bom_map.csv")
-BOM_COLUMNS = ['component_sku', 'component_name', 'match_brand', 'match_size',
-               'match_strain', 'component_role', 'qty_per_unit', 'allocation', 'notes']
+BOM_COLUMNS = ['product_type', 'component_sku', 'component_name', 'component_role', 'notes']
 BOM_ROLES = ['mylar', 'jar', 'cap', 'master_case', 'concentrate_jar', 'other']
-# auto: component burn = sum over matching finished SKUs of (daily sell-through x
-# qty_per_unit). shared_manual: component is shared across SKUs not yet fully
-# mapped, so the reorder view flags it instead of auto-splitting (e.g. White Caps
-# 50mm, generic 5oz jars) until the consuming SKUs / split rule are confirmed here.
-BOM_ALLOCATIONS = ['auto', 'shared_manual']
 # Finished retail-unit size a jar/cap pairs with, when the component name carries
 # only the physical jar size (oz/mm) rather than the retail unit size.
 JAR_BRAND_DEFAULT_SIZE = {
     'High Five': '5g', 'Black Label Platinum': '3.5g', 'PTO': '3.5g', 'Dope St.': '14g',
 }
 
-# Columns of the tracked-components config (tracked_components.csv).
+# Columns of the tracked-components config (tracked_components.csv). One row per
+# packaging component Haven reorders (the on-hand-tracked SKUs); product/case
+# relationships live in product_types.csv + bom_map.csv, not here.
 TRACKED_COMPONENT_COLUMNS = ['distru_product', 'sku', 'haven_component', 'brand', 'pkg_type']
 
 # Brand-spelling reconciliations between Headset sell-through and the packaging
@@ -183,7 +194,7 @@ def initialize_session_state():
             st.session_state[var] = None
 
     if st.session_state.app_version is None:
-        st.session_state.app_version = "4.4.0"
+        st.session_state.app_version = "5.0.0"
 
 initialize_session_state()
 
@@ -1094,8 +1105,8 @@ def _norm_size(s) -> str:
 
 
 def _fmt_qty(v) -> str:
-    """Format a qty_per_unit for CSV/display: whole numbers as ints (1 not 1.0),
-    fractions compactly (0.1), blank or NaN as ''."""
+    """Format a numeric count for CSV/display (e.g. units_per_case): whole numbers as
+    ints (60 not 60.0), fractions compactly, blank or NaN as ''."""
     n = pd.to_numeric(v, errors='coerce')
     if pd.isna(n):
         return ''
@@ -1127,6 +1138,44 @@ def save_tracked_components(df: pd.DataFrame) -> bool:
 
 
 @st.cache_data
+def load_product_types() -> Optional[pd.DataFrame]:
+    """Load the product-types config (committed at repo root). One row per finished
+    product type carrying its units_per_case and the brand/size/variant that
+    identifies its Headset sell-through. Returns None if absent so the Hygiene tab
+    seeds a proposal from the tracked components."""
+    try:
+        if not os.path.exists(PRODUCT_TYPES_PATH):
+            return None
+        df = pd.read_csv(PRODUCT_TYPES_PATH, dtype=str).fillna('')
+        for c in PRODUCT_TYPE_COLUMNS:
+            if c not in df.columns:
+                df[c] = ''
+        return df if not df.empty else None
+    except Exception:
+        return None
+
+
+def save_product_types(df: pd.DataFrame) -> bool:
+    """Persist the edited product-types list to the committed CSV + clear the cache.
+    units_per_case is written as a clean whole number. Same ephemeral-filesystem
+    caveat as the other saves: durable locally, promote fleet-wide via a git commit."""
+    try:
+        out = df.copy()
+        for c in PRODUCT_TYPE_COLUMNS:
+            if c not in out.columns:
+                out[c] = ''
+        out['units_per_case'] = out['units_per_case'].map(_fmt_qty)
+        out = out[PRODUCT_TYPE_COLUMNS].fillna('').astype(str)
+        out = out[out['product_type'].str.strip() != '']
+        out.to_csv(PRODUCT_TYPES_PATH, index=False)
+        load_product_types.clear()
+        return True
+    except Exception as e:
+        st.warning(f"Could not save product types: {str(e)}")
+        return False
+
+
+@st.cache_data
 def load_bom_map() -> Optional[pd.DataFrame]:
     """Load the finished-SKU -> packaging-component BOM map (committed config at
     repo root). Returns None if absent so the Hygiene tab seeds a proposal."""
@@ -1150,9 +1199,7 @@ def save_bom_map(df: pd.DataFrame) -> bool:
         for c in BOM_COLUMNS:
             if c not in out.columns:
                 out[c] = ''
-        out = out[BOM_COLUMNS].copy()
-        out['qty_per_unit'] = out['qty_per_unit'].map(_fmt_qty)
-        out = out.fillna('').astype(str)
+        out = out[BOM_COLUMNS].fillna('').astype(str)
         # A line is meaningful only if it points at a component.
         out = out[out['component_sku'].str.strip() != '']
         out.to_csv(BOM_MAP_PATH, index=False)
@@ -1190,81 +1237,117 @@ def _infer_component_role(name: str) -> str:
     return 'other'
 
 
-def seed_bom_map(tracked_df: pd.DataFrame) -> pd.DataFrame:
-    """Generate a proposed BOM map from the tracked-components list.
+def _infer_variant(name: str) -> str:
+    """Infer the variant that distinguishes one packaging component from a sibling
+    of the same brand+size: a flower category (Indica/Sativa/Hybrid) or a gummy
+    flavor. Blank when the brand+size has a single packaging line."""
+    nm = str(name)
+    m = re.search(r'\b(indica|sativa|hybrid)\b', nm, re.IGNORECASE)
+    if m:
+        return m.group(1).capitalize()
+    m = re.search(r'formula gummies\s+(.+)$', nm, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return ''
 
-    One line per (component -> finished-SKU match key). Mylars and master cases
-    carry the finished size in their name; jars/caps fall back to a per-brand
-    default. Shared components (generic jars, White Caps, High Five 5oz jars) are
-    flagged allocation=shared_manual so the reorder view will not auto-split them
-    until the consuming SKUs / split rule are confirmed. Master-case qty_per_unit
-    is left blank unless the pack size is known (e.g. "(10/Case)" -> 0.1), which
-    surfaces it as a gap to fill. This is a STARTING PROPOSAL for human review.
+
+def _parse_component(t: pd.Series) -> Optional[dict]:
+    """Parse one tracked-components row into the fields the product model needs:
+    canonical brand (name-derived, so a mislabeled brand column is corrected),
+    finished size, packaging role, variant, and a master-case units_per_case lifted
+    from a "(N/Case)" name pattern when present."""
+    name = str(t.get('haven_component') or t.get('distru_product') or '').strip()
+    distru_product = str(t.get('distru_product') or '')
+    sku = str(t.get('sku') or '').strip()
+    if not sku and not name:
+        return None
+    role = _infer_component_role(name)
+    brand = extract_pl_brand_from_name(name) or ''
+    if not brand:
+        b = str(t.get('brand') or '').strip()
+        brand = '' if b.lower() in ('', 'generic') else b
+    size = _extract_finished_size(name)
+    if not size and role in ('jar', 'cap'):
+        size = JAR_BRAND_DEFAULT_SIZE.get(brand, '')
+    upc = ''
+    if role == 'master_case':
+        m = re.search(r'(\d+)\s*/\s*case', f'{name} {distru_product}', re.IGNORECASE)
+        upc = m.group(1) if m else ''
+    return {'sku': sku, 'name': name, 'brand': brand, 'size': size,
+            'role': role, 'variant': _infer_variant(name), 'units_per_case': upc}
+
+
+def seed_product_model(tracked_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Derive a STARTING-PROPOSAL product-types table and product->ingredient BOM
+    from the tracked-components list.
+
+    Components are grouped by (brand, size). Primary components (mylar/jar) define a
+    product type each, split by variant where they differ (the three Cloud9ne mylars
+    -> three product types). Shared components in the group (the master case, a
+    shared cap) attach to every product type in it, so a master case shared across
+    the three MikroDose blends is consumed by all three and its burn sums naturally.
+    Brand-less components (generic jars) become unassigned BOM lines for the human to
+    attach. units_per_case comes from a "(N/Case)" name pattern when present, else is
+    left blank to fill on the product type. This is a proposal for human review.
     """
+    empty_pt = pd.DataFrame(columns=PRODUCT_TYPE_COLUMNS)
+    empty_bom = pd.DataFrame(columns=BOM_COLUMNS)
     if tracked_df is None or tracked_df.empty:
-        return pd.DataFrame(columns=BOM_COLUMNS)
+        return empty_pt, empty_bom
 
-    rows = []
-    for _, t in tracked_df.iterrows():
-        name = str(t.get('haven_component') or t.get('distru_product') or '').strip()
-        distru_product = str(t.get('distru_product') or '')
-        sku = str(t.get('sku') or '').strip()
-        if not sku and not name:
-            continue
-
-        role = _infer_component_role(name)
-
-        # Brand: prefer name-derived canonical (handles brand-column mislabels,
-        # e.g. the Black Label master case tagged "Dope St."); fall back to the
-        # brand column, treating "Generic"/blank as no brand.
-        brand = extract_pl_brand_from_name(name) or ''
-        if not brand:
-            b = str(t.get('brand') or '').strip()
-            brand = '' if b.lower() in ('', 'generic') else b
-
-        size = _extract_finished_size(name)
-        if not size and role in ('jar', 'cap'):
-            size = JAR_BRAND_DEFAULT_SIZE.get(brand, '')
-
-        strain = ''
-        if role == 'concentrate_jar':
-            m = re.search(r'-\s*(.+?)\s+\d', name)   # "... - Black Jack  1g"
-            strain = m.group(1).strip() if m else ''
-
-        if role == 'master_case':
-            mcase = re.search(r'(\d+)\s*/\s*case', f'{name} {distru_product}', re.IGNORECASE)
-            cases = int(mcase.group(1)) if mcase else 0
-            qty = round(1.0 / cases, 4) if cases > 0 else ''
+    comps = [c for c in (_parse_component(t) for _, t in tracked_df.iterrows()) if c]
+    groups, orphans = {}, []
+    for c in comps:
+        if not c['brand']:
+            orphans.append(c)
         else:
-            qty = 1
+            groups.setdefault((c['brand'], c['size']), []).append(c)
 
-        name_l = name.lower()
-        is_generic = (not brand) or 'no cap' in name_l or str(t.get('brand') or '').strip().lower() == 'generic'
-        is_high_five_jar = (brand == 'High Five' and role == 'jar')  # multiple 5oz entries; confirm current
-        shared = (role == 'cap') or is_generic or is_high_five_jar
-        allocation = 'shared_manual' if shared else 'auto'
+    PRIMARY = ('mylar', 'jar', 'concentrate_jar')
+    pt_rows, bom_rows = [], []
 
-        note = []
-        if role == 'master_case' and qty == '':
-            note.append('set units-per-case')
-        if shared:
-            note.append('shared component - confirm consuming SKUs / split')
-        if not brand:
-            note.append('no brand match - set match_brand')
-
-        rows.append({
-            'component_sku': sku,
-            'component_name': name,
-            'match_brand': brand,
-            'match_size': size,
-            'match_strain': strain,
-            'component_role': role,
-            'qty_per_unit': qty,
-            'allocation': allocation,
-            'notes': '; '.join(note),
+    def _add_bom(pt_name, c, extra_note=''):
+        # No quantity: ingredients are one-per-unit, and the master case is derived
+        # from the product type's units_per_case at compute time.
+        note = [extra_note] if extra_note else []
+        bom_rows.append({
+            'product_type': pt_name, 'component_sku': c['sku'], 'component_name': c['name'],
+            'component_role': c['role'], 'notes': '; '.join(note),
         })
 
-    return pd.DataFrame(rows, columns=BOM_COLUMNS)
+    for (brand, size), members in groups.items():
+        primaries = [c for c in members if c['role'] in PRIMARY]
+        shared = [c for c in members if c['role'] not in PRIMARY]   # master_case, cap, other
+        upc = next((c['units_per_case'] for c in shared if c['units_per_case']), '')
+
+        if primaries:
+            variants = []
+            for c in primaries:
+                if c['variant'] not in variants:
+                    variants.append(c['variant'])
+        else:
+            variants = ['']   # master-case-only product (e.g. Lil' Buzzies)
+
+        for v in variants:
+            pt_name = ' '.join(x for x in [brand, size, v] if x).strip()
+            pt_rows.append({
+                'product_type': pt_name, 'match_brand': brand, 'match_size': size,
+                'match_variant': v, 'units_per_case': upc, 'notes': '',
+            })
+            vprimaries = [c for c in primaries if c['variant'] == v]
+            alt = len(vprimaries) > 1
+            for c in vprimaries:
+                _add_bom(pt_name, c, 'multiple options for this role - keep the current one' if alt else '')
+            for c in shared:
+                _add_bom(pt_name, c)
+
+    for c in orphans:
+        bom_rows.append({
+            'product_type': '', 'component_sku': c['sku'], 'component_name': c['name'],
+            'component_role': c['role'], 'notes': 'unassigned - set the product_type this belongs to',
+        })
+
+    return pd.DataFrame(pt_rows, columns=PRODUCT_TYPE_COLUMNS), pd.DataFrame(bom_rows, columns=BOM_COLUMNS)
 
 # =============================================================================
 # DATA PROCESSING FUNCTIONS
@@ -1893,33 +1976,38 @@ def render_bl_inputs_tab(df: Optional[pd.DataFrame], meta: Optional[dict] = None
 
 def render_hygiene_tab(bl_df: Optional[pd.DataFrame], combined_df: Optional[pd.DataFrame] = None):
     """
-    Render the Packaging Hygiene tab.
+    Render the Packaging Hygiene tab (product-centric model).
 
-    Maintenance surface for the packaging tracker, kept separate from the clean
-    reorder view. Two editors: (1) the tracked-component list (the packaging SKUs
-    Haven reorders) and (2) the bill-of-materials linking finished retail SKUs to
-    the components they consume. Both persist to version-controlled CSVs at the
-    repo root. A coverage check surfaces unmapped components, master cases missing
-    a pack size, shared components awaiting a split rule, and PL brands selling
-    with no packaging mapped.
+    Three editors: (1) the tracked-component list (the packaging SKUs Haven
+    reorders), (2) the product types (each finished product at the grain where its
+    packaging is constant, carrying units_per_case + the Headset match), and (3) the
+    bill-of-materials linking each product type to the components it consumes. All
+    persist to version-controlled CSVs at the repo root. A coverage check surfaces
+    unassigned components, product types missing a case quantity, and brand gaps.
     """
     st.header("🧼 Packaging Hygiene")
     st.caption(
-        "Edit the tracked component list and the bill-of-materials that links "
-        "finished retail SKUs to the packaging they consume. Saving writes the "
-        "version-controlled CSVs at the repo root. Commit and push to keep edits "
-        "across machines and deploys (an uncommitted edit only lives on this machine)."
+        "Three editors: the tracked components Haven reorders, the product types "
+        "(each carrying its case quantity), and the bill-of-materials linking a "
+        "product to its packaging. Saving writes version-controlled CSVs at the repo "
+        "root. Commit and push to keep edits across machines (an uncommitted edit "
+        "only lives on this machine)."
     )
 
     tracked_df = load_tracked_components()
     if tracked_df is None:
         tracked_df = pd.DataFrame(columns=TRACKED_COMPONENT_COLUMNS)
 
+    # Seed product types + BOM together (held stable in session_state so an
+    # in-editor edit is not shuffled out from under the data_editor each rerun).
+    if 'hygiene_seed' not in st.session_state:
+        st.session_state['hygiene_seed'] = seed_product_model(tracked_df)
+    pt_seed, bom_seed = st.session_state['hygiene_seed']
+
     # ---- Section 1: tracked component list -------------------------------
     st.subheader("1. Tracked components")
 
-    # Read-only "present in latest Beyond Legends upload" status (mirrors the
-    # Input Materials tab's missing-component check), shown above the editor.
+    # Read-only "present in latest Beyond Legends upload" status, shown above the editor.
     if bl_df is not None and not bl_df.empty and not tracked_df.empty:
         present_keys = {_norm_match_key(p) for p in bl_df.get('Product', pd.Series(dtype=str))}
         present_skus = {_norm_sku(s) for s in bl_df.get('SKU', pd.Series(dtype=str))}
@@ -1945,7 +2033,7 @@ def render_hygiene_tab(bl_df: Optional[pd.DataFrame], combined_df: Optional[pd.D
         st.caption("Upload the Beyond Legends Distru CSV in the sidebar to check which tracked components are in the current on-hand export.")
 
     edited_tracked = st.data_editor(
-        tracked_df, num_rows="dynamic", use_container_width=True, height=420,
+        tracked_df, num_rows="dynamic", use_container_width=True, height=380,
         key="hygiene_tracked",
         column_config={
             'distru_product': st.column_config.TextColumn('distru_product', help="Exact Distru product name (the match key to on-hand)."),
@@ -1955,67 +2043,105 @@ def render_hygiene_tab(bl_df: Optional[pd.DataFrame], combined_df: Optional[pd.D
             'pkg_type': st.column_config.TextColumn('pkg_type', help="e.g. Mylar Bag, Master Case."),
         },
     )
-    if st.button("💾 Save component list", key="save_tracked"):
-        if save_tracked_components(edited_tracked):
-            st.session_state.pop('hygiene_bom_seed', None)
-            st.success("✅ Saved tracked_components.csv. Commit and push to keep it across machines and deploys.")
+    save_c, rm_c = st.columns([1, 2])
+    with save_c:
+        if st.button("💾 Save component list", key="save_tracked"):
+            if save_tracked_components(edited_tracked):
+                st.session_state.pop('hygiene_seed', None)
+                st.success("✅ Saved. Product types + BOM proposal refresh below. Commit and push to keep it across machines.")
+                st.rerun()
+    with rm_c:
+        # Explicit removal control. The data_editor supports native row deletion
+        # (select the row checkbox, then the trash icon), but it is not obvious, so
+        # this gives a discoverable path to stop tracking a component.
+        names = sorted({str(n).strip() for n in edited_tracked.get('haven_component', pd.Series(dtype=str)) if str(n).strip()})
+        to_remove = st.multiselect(
+            "Stop tracking (remove components)", options=names, key="hygiene_remove_select",
+            help="Removes the selected components from the tracked list and the reorder scope. "
+                 "Re-add later by typing a new row in the editor above. Commit + push to promote.")
+        if st.button("🗑️ Remove selected", key="hygiene_remove_btn", disabled=not to_remove):
+            keep = edited_tracked[~edited_tracked['haven_component'].astype(str).str.strip().isin(to_remove)]
+            if save_tracked_components(keep):
+                st.session_state.pop('hygiene_seed', None)
+                st.session_state.pop('hygiene_remove_select', None)
+                st.success(f"✅ Removed {len(to_remove)} component(s). Commit and push to promote fleet-wide.")
+                st.rerun()
+
+    st.markdown("---")
+
+    # ---- Section 2: product types ----------------------------------------
+    st.subheader("2. Product types (case quantity lives here)")
+
+    pt_df = load_product_types()
+    if pt_df is None or pt_df.empty:
+        pt_df = pt_seed
+        if not pt_df.empty:
+            st.info("No product_types.csv yet, so this is a proposed starter set derived from the "
+                    "tracked components. Set each **units_per_case** (the count, e.g. 60), confirm the "
+                    "brand/size/variant that matches Headset sell-through, then Save.")
+    st.markdown(
+        "One row per finished product at the grain where its packaging is constant "
+        "(Black Label 3.5g is one type; Cloud9ne 3.5g splits into Indica/Sativa/Hybrid "
+        "because the mylar differs). **units_per_case** = finished units per master case "
+        "(type the whole count). **match_variant** = a category (Indica/Sativa/Hybrid) or "
+        "a flavor used to pull the right Headset sell-through; blank = the whole brand+size."
+    )
+    pt_df = pt_df.copy()
+    pt_df['units_per_case'] = pd.to_numeric(pt_df.get('units_per_case'), errors='coerce')
+    edited_pt = st.data_editor(
+        pt_df, num_rows="dynamic", use_container_width=True, height=420,
+        key="hygiene_pt",
+        column_config={
+            'product_type': st.column_config.TextColumn('product_type', help="Display name, e.g. 'Black Label 3.5g'."),
+            'match_brand': st.column_config.TextColumn('match_brand', help="Brand to match in Headset sell-through (case-insensitive)."),
+            'match_size': st.column_config.TextColumn('match_size', help="Finished unit size, e.g. 3.5g. Blank = any size of the brand."),
+            'match_variant': st.column_config.TextColumn('match_variant', help="Indica/Sativa/Hybrid (matches Flower Category) or a flavor (matches the product name). Blank = all."),
+            'units_per_case': st.column_config.NumberColumn('units_per_case', min_value=1, step=1, format="%d", help="Finished units per master case (the count, e.g. 60)."),
+            'notes': st.column_config.TextColumn('notes'),
+        },
+    )
+    if st.button("💾 Save product types", key="save_pt"):
+        if save_product_types(edited_pt):
+            st.success("✅ Saved product_types.csv. Commit and push to keep it across machines and deploys.")
             st.rerun()
 
     st.markdown("---")
 
-    # ---- Section 2: bill of materials ------------------------------------
-    st.subheader("2. Bill of materials (finished SKU to component)")
+    # ---- Section 3: bill of materials (product -> ingredient) ------------
+    st.subheader("3. Bill of materials (product → ingredients)")
 
     bom_df = load_bom_map()
     if bom_df is None or bom_df.empty:
-        # Seed once and hold it stable in session_state. Regenerating the seed on
-        # every rerun would shift rows out from under the data_editor's edit diff
-        # (e.g. if the component list is edited), shuffling unsaved BOM work.
-        if 'hygiene_bom_seed' not in st.session_state:
-            st.session_state['hygiene_bom_seed'] = seed_bom_map(tracked_df)
-        bom_df = st.session_state['hygiene_bom_seed']
+        bom_df = bom_seed
         if not bom_df.empty:
-            st.info(
-                "No bom_map.csv yet, so this is a proposed starter mapping generated "
-                "from the tracked components. Review the flagged rows (shared components "
-                "and master-case quantities in particular), then Save to create the file."
-            )
-
+            st.info("No bom_map.csv yet, so this is a proposed starter mapping. Each line is one "
+                    "component a product consumes. Assign any 'unassigned' rows, drop any duplicate "
+                    "(alternate-packaging) lines, then Save.")
     st.markdown(
-        "**qty_per_unit** = component units consumed per one finished retail unit "
-        "(a master case of N units = 1/N, e.g. 10/case = 0.1). "
-        "**allocation**: `auto` means burn = sum of matching SKU sell-through times "
-        "qty_per_unit; `shared_manual` means the component is shared across SKUs not "
-        "yet fully mapped, so the reorder view flags it instead of auto-splitting. "
-        "Flip White Caps and shared jars to `auto` once their consuming SKUs are confirmed."
+        "Each row is one component a product type consumes. There is no quantity: every "
+        "ingredient is **one per unit**, and the master case (the only \"N per\" relationship) "
+        "is derived from the product type's **units_per_case** (Section 2). So a product is just "
+        "its mylar/jar + its master case (+ a cap where it applies)."
     )
-
-    # qty_per_unit must be numeric for the NumberColumn editor (load reads strings).
     bom_df = bom_df.copy()
-    bom_df['qty_per_unit'] = pd.to_numeric(bom_df.get('qty_per_unit'), errors='coerce')
 
-    sku_options = sorted(set(
-        [str(s).strip() for s in tracked_df.get('sku', pd.Series(dtype=str)) if str(s).strip()]
-        + [str(s).strip() for s in bom_df.get('component_sku', pd.Series(dtype=str)) if str(s).strip()]
-    ))
-
-    sku_col = (st.column_config.SelectboxColumn('component_sku', options=sku_options,
-                                                help="Component this line consumes (the tracked-component SKU).")
-               if sku_options else
-               st.column_config.TextColumn('component_sku', help="Component this line consumes (the tracked-component SKU)."))
+    pt_options = sorted({str(p).strip() for p in edited_pt.get('product_type', pd.Series(dtype=str)) if str(p).strip()}
+                        | {str(p).strip() for p in bom_df.get('product_type', pd.Series(dtype=str)) if str(p).strip()})
+    sku_options = sorted({str(s).strip() for s in tracked_df.get('sku', pd.Series(dtype=str)) if str(s).strip()}
+                         | {str(s).strip() for s in bom_df.get('component_sku', pd.Series(dtype=str)) if str(s).strip()})
+    pt_col = (st.column_config.SelectboxColumn('product_type', options=[''] + pt_options, help="The product type that consumes this component. Blank = unassigned.")
+              if pt_options else st.column_config.TextColumn('product_type'))
+    sku_col = (st.column_config.SelectboxColumn('component_sku', options=sku_options, help="The tracked-component SKU this line consumes.")
+               if sku_options else st.column_config.TextColumn('component_sku'))
 
     edited_bom = st.data_editor(
         bom_df, num_rows="dynamic", use_container_width=True, height=520,
         key="hygiene_bom",
         column_config={
+            'product_type': pt_col,
             'component_sku': sku_col,
             'component_name': st.column_config.TextColumn('component_name'),
-            'match_brand': st.column_config.TextColumn('match_brand', help="Brand to match in Headset sell-through (case-insensitive)."),
-            'match_size': st.column_config.TextColumn('match_size', help="Finished unit size, e.g. 3.5g. Blank = any size of the brand."),
-            'match_strain': st.column_config.TextColumn('match_strain', help="Only for per-strain components (Crashout jars). Blank = all strains."),
             'component_role': st.column_config.SelectboxColumn('component_role', options=BOM_ROLES),
-            'qty_per_unit': st.column_config.NumberColumn('qty_per_unit', format="%.4f", min_value=0.0, help="Components per one finished unit. Master case = 1/units-per-case."),
-            'allocation': st.column_config.SelectboxColumn('allocation', options=BOM_ALLOCATIONS),
             'notes': st.column_config.TextColumn('notes'),
         },
     )
@@ -2024,98 +2150,127 @@ def render_hygiene_tab(bl_df: Optional[pd.DataFrame], combined_df: Optional[pd.D
     with save_col:
         if st.button("💾 Save BOM map", key="save_bom"):
             if save_bom_map(edited_bom):
-                st.session_state.pop('hygiene_bom_seed', None)
                 st.success("✅ Saved bom_map.csv. Commit and push to keep it across machines and deploys.")
                 st.rerun()
     with dl_col:
         bom_buf = io.StringIO()
-        save_view = edited_bom.copy()
-        save_view['qty_per_unit'] = save_view['qty_per_unit'].map(_fmt_qty)
-        save_view.to_csv(bom_buf, index=False)
+        edited_bom.to_csv(bom_buf, index=False)
         st.download_button("⬇️ Download BOM map CSV", data=bom_buf.getvalue(),
                            file_name=f"bom_map_{datetime.now().strftime('%Y%m%d')}.csv",
                            mime="text/csv", key="bom_download")
 
     st.markdown("---")
 
-    # ---- Section 3: coverage check ---------------------------------------
-    st.subheader("3. Coverage check")
+    # ---- Section 4: coverage check ---------------------------------------
+    st.subheader("4. Coverage check")
 
     bom_live = edited_bom[edited_bom['component_sku'].fillna('').astype(str).str.strip() != ''].copy()
+    bom_live['product_type'] = bom_live['product_type'].fillna('').astype(str).str.strip()
+    bom_live['component_role'] = bom_live['component_role'].fillna('').astype(str)
 
-    # Tracked components with no BOM line (matched by normalized SKU, ';'-split).
-    tracked_sku_set = set()
-    for s in tracked_df.get('sku', pd.Series(dtype=str)):
-        for part in str(s).split(';'):
-            if part.strip():
-                tracked_sku_set.add(_norm_sku(part))
-    mapped_sku_set = set()
-    for s in bom_live['component_sku']:
-        for part in str(s).split(';'):
-            if part.strip():
-                mapped_sku_set.add(_norm_sku(part))
+    # Tracked components with no BOM line.
+    tracked_sku_set = {_norm_sku(part) for s in tracked_df.get('sku', pd.Series(dtype=str))
+                       for part in str(s).split(';') if part.strip()}
+    mapped_sku_set = {_norm_sku(part) for s in bom_live['component_sku']
+                      for part in str(s).split(';') if part.strip()}
     unmapped_skus = sorted(tracked_sku_set - mapped_sku_set)
 
-    master_no_qty = bom_live[(bom_live['component_role'] == 'master_case') & (bom_live['qty_per_unit'].isna())]
-    shared_rows = bom_live[bom_live['allocation'] == 'shared_manual']
+    unassigned = bom_live[bom_live['product_type'] == '']
+
+    # Product types that carry a master case but have no units_per_case set.
+    pt_upc = {str(r['product_type']).strip(): pd.to_numeric(r['units_per_case'], errors='coerce')
+              for _, r in edited_pt.iterrows() if str(r.get('product_type', '')).strip()}
+    mc_pts = {str(r['product_type']).strip() for _, r in bom_live.iterrows()
+              if r['component_role'] == 'master_case' and str(r['product_type']).strip()}
+    pts_missing_upc = sorted(pt for pt in mc_pts if pd.isna(pt_upc.get(pt)))
 
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("BOM lines", f"{len(bom_live)}")
-    m2.metric("Unmapped components", f"{len(unmapped_skus)}")
-    m3.metric("Master cases missing qty", f"{len(master_no_qty)}")
-    m4.metric("Shared (manual)", f"{len(shared_rows)}")
+    m1.metric("Product types", f"{len(edited_pt[edited_pt['product_type'].astype(str).str.strip() != ''])}")
+    m2.metric("BOM lines", f"{len(bom_live)}")
+    m3.metric("Unassigned components", f"{len(unassigned)}")
+    m4.metric("Cases missing units/case", f"{len(pts_missing_upc)}")
 
     if unmapped_skus:
         with st.expander(f"⚠️ {len(unmapped_skus)} tracked component(s) with no BOM line"):
             ref = tracked_df[tracked_df['sku'].apply(
                 lambda s: any(_norm_sku(p) in unmapped_skus for p in str(s).split(';') if p.strip()))]
-            st.dataframe(
-                ref[['haven_component', 'sku', 'brand', 'pkg_type']] if not ref.empty
-                else pd.DataFrame({'sku': unmapped_skus}),
-                hide_index=True, use_container_width=True)
-    if not master_no_qty.empty:
-        with st.expander(f"⚠️ {len(master_no_qty)} master case(s) missing units-per-case"):
-            st.dataframe(master_no_qty[['component_sku', 'component_name', 'match_brand', 'match_size']],
+            st.dataframe(ref[['haven_component', 'sku', 'brand', 'pkg_type']] if not ref.empty
+                         else pd.DataFrame({'sku': unmapped_skus}), hide_index=True, use_container_width=True)
+    if not unassigned.empty:
+        with st.expander(f"⚠️ {len(unassigned)} component(s) not assigned to a product type"):
+            st.dataframe(unassigned[['component_name', 'component_sku', 'component_role', 'notes']],
                          hide_index=True, use_container_width=True)
-    if not shared_rows.empty:
-        with st.expander(f"ℹ️ {len(shared_rows)} shared component(s) set to manual (not auto-split)"):
-            st.dataframe(shared_rows[['component_sku', 'component_name', 'match_brand', 'match_size', 'notes']],
-                         hide_index=True, use_container_width=True)
+    if pts_missing_upc:
+        with st.expander(f"⚠️ {len(pts_missing_upc)} product type(s) with a master case but no units_per_case"):
+            st.write(", ".join(pts_missing_upc))
+            st.caption("Set units_per_case in Section 2 so the master-case reorder can compute.")
 
-    # Headset-side: PL brands selling with no auto BOM coverage. Brand-level
-    # (robust to size-format differences); per-size coverage lands with the reorder tab.
+    # Headset-side: PL brands selling with no product-type coverage.
     if combined_df is not None and not combined_df.empty and 'Brand' in combined_df.columns:
         selling_brands = {_canonical_brand_key(b) for b in combined_df['Brand'].dropna().unique() if str(b).strip()}
-        auto_bom = bom_live[bom_live['allocation'] == 'auto']
-        covered_brands = {_canonical_brand_key(b) for b in auto_bom['match_brand'] if str(b).strip()}
+        covered_brands = {_canonical_brand_key(b) for b in edited_pt.get('match_brand', pd.Series(dtype=str)) if str(b).strip()}
         uncovered = sorted(selling_brands - covered_brands)
-        # Inverse: auto lines whose brand never appears in the in-scope sell-through
-        # (e.g. Formula gummies, an edible filtered out of combined_df, or house
-        # labels). They look mapped but would compute zero burn, so call them out.
         dead = sorted(b for b in covered_brands if b and b not in selling_brands)
         if uncovered:
-            with st.expander(f"⚠️ {len(uncovered)} PL brand(s) selling with no auto BOM coverage"):
+            with st.expander(f"⚠️ {len(uncovered)} PL brand(s) selling with no product type"):
                 st.write(", ".join(uncovered))
-                st.caption("Brand-level check (includes brands whose packaging is not tracked). "
-                           "Per-size reorder coverage arrives with the reorder tab.")
+                st.caption("Brands appearing in Headset sell-through with no product type to attribute it to "
+                           "(may be untracked packaging, or a match_brand spelling gap).")
         if dead:
-            with st.expander(f"⚠️ {len(dead)} mapped brand(s) with no in-scope retail sell-through (would compute zero burn)"):
+            with st.expander(f"ℹ️ {len(dead)} product-type brand(s) with no in-scope retail sell-through (zero burn)"):
                 st.write(", ".join(dead))
-                st.caption("These auto BOM lines point at brands absent from the Headset flower/preroll/vape "
-                           "sell-through (e.g. edibles like Formula gummies, or house labels). Confirm the "
-                           "brand spelling or set allocation to shared_manual.")
+                st.caption("Product types whose brand is absent from the Headset flower/preroll/vape sell-through "
+                           "(e.g. edibles like Formula gummies, or a match_brand spelling gap).")
 
 
-def compute_component_reorder(bom_df: Optional[pd.DataFrame], bl_df: Optional[pd.DataFrame],
-                              sales_df: Optional[pd.DataFrame], target_weeks: float) -> pd.DataFrame:
-    """Per-component packaging reorder calc.
+def compute_product_type_burn(pt_df: Optional[pd.DataFrame], sales_df: Optional[pd.DataFrame]) -> dict:
+    """Daily finished-unit sell-through for each product type, matched from Headset
+    by canonical brand + size, then narrowed by variant: a category variant
+    (Indica/Sativa/Hybrid) matches the Flower Category; any other variant (a gummy
+    flavor) matches a product-name substring. Returns {product_type: daily_units}."""
+    burn = {}
+    if pt_df is None or pt_df.empty:
+        return burn
+    have_sales = sales_df is not None and not sales_df.empty and 'Brand' in sales_df.columns
+    if have_sales:
+        s_bkey = sales_df['Brand'].map(_canonical_brand_key)
+        s_size = sales_df.get('Weight', pd.Series('', index=sales_df.index)).map(_norm_size)
+        s_pname = sales_df.get('Product Name', pd.Series('', index=sales_df.index)).astype(str).str.lower()
+        s_cat = sales_df.get('Flower Category', pd.Series('', index=sales_df.index)).astype(str).str.lower()
+        s_burn = pd.to_numeric(sales_df.get('In Stock Avg Units per Day'), errors='coerce').fillna(0.0)
+    for _, p in pt_df.iterrows():
+        pt = str(p.get('product_type') or '').strip()
+        if not pt:
+            continue
+        bkey = _canonical_brand_key(p.get('match_brand'))
+        if not have_sales or not bkey:
+            burn[pt] = 0.0
+            continue
+        m = (s_bkey == bkey)
+        size = _norm_size(p.get('match_size'))
+        if size:
+            m = m & (s_size == size)
+        var = str(p.get('match_variant') or '').strip().lower()
+        if var:
+            if var in ('indica', 'sativa', 'hybrid'):
+                m = m & s_cat.str.contains(var, na=False)
+            else:
+                m = m & s_pname.str.contains(re.escape(var), na=False)
+        burn[pt] = float(s_burn[m].sum())
+    return burn
 
-    For each component in the saved BOM map, joins on-hand (Beyond Legends Distru
-    Active Quantity) with the daily burn implied by the finished-SKU sell-through
-    of the products that consume it. Burn for an `auto` BOM line = sum over the
-    matching finished SKUs of (daily sell-through x qty_per_unit); `shared_manual`
-    lines are flagged, not auto-summed. Weeks-on-hand reuses calculate_woh; the
-    suggested order brings the component up to target_weeks of cover.
+
+def compute_component_reorder(bom_df: Optional[pd.DataFrame], pt_df: Optional[pd.DataFrame],
+                              bl_df: Optional[pd.DataFrame], sales_df: Optional[pd.DataFrame],
+                              target_weeks: float) -> pd.DataFrame:
+    """Per-component packaging reorder, product-centric.
+
+    Each product type's daily finished-unit sell-through flows to the components it
+    consumes: one-per-unit for a mylar/jar/cap, and 1/units_per_case for its master
+    case. A component used by several product types (a shared master case, a shared
+    cap) sums their contributions explicitly - no heuristic split, no SKU-collision
+    double-count. On-hand joins the Beyond Legends Distru Active Quantity; the
+    suggested order brings each component to target_weeks of cover.
     """
     if bom_df is None or bom_df.empty:
         return pd.DataFrame()
@@ -2124,8 +2279,15 @@ def compute_component_reorder(bom_df: Optional[pd.DataFrame], bl_df: Optional[pd
     bom = bom[bom['component_sku'].str.strip() != '']
     if bom.empty:
         return pd.DataFrame()
-    bom['qty_per_unit'] = pd.to_numeric(bom.get('qty_per_unit'), errors='coerce')
-    bom['allocation'] = bom.get('allocation', '').fillna('').astype(str)
+    bom['product_type'] = bom.get('product_type', '').fillna('').astype(str)
+    bom['component_role'] = bom.get('component_role', '').fillna('').astype(str)
+
+    pt_burn = compute_product_type_burn(pt_df, sales_df)
+    # units_per_case per product type drives the master-case fraction (1/N).
+    pt_upc = {}
+    if pt_df is not None and not pt_df.empty:
+        for _, p in pt_df.iterrows():
+            pt_upc[str(p.get('product_type') or '').strip()] = pd.to_numeric(p.get('units_per_case'), errors='coerce')
 
     # On-hand lookup by normalized SKU, with a product-name fallback.
     onhand_by_sku, onhand_by_name = {}, {}
@@ -2140,50 +2302,6 @@ def compute_component_reorder(bom_df: Optional[pd.DataFrame], bl_df: Optional[pd
             if nm:
                 onhand_by_name[nm] = onhand_by_name.get(nm, 0.0) + q
 
-    # Pre-extract sell-through match keys once.
-    sales = None
-    if sales_df is not None and not sales_df.empty and 'Brand' in sales_df.columns:
-        sales = pd.DataFrame({
-            '_bkey': sales_df['Brand'].map(_canonical_brand_key),
-            '_size': sales_df.get('Weight', pd.Series('', index=sales_df.index)).map(_norm_size),
-            '_pname': sales_df.get('Product Name', pd.Series('', index=sales_df.index)).astype(str).str.lower(),
-            '_burn': pd.to_numeric(sales_df.get('In Stock Avg Units per Day'), errors='coerce').fillna(0.0),
-        })
-
-    # True variant components (same brand+size+strain AND same role, e.g. the three
-    # Cloud9ne strain-variant mylars seeded with blank strain) each match the same
-    # finished SKUs and are alternatives, so split that sell-through evenly across
-    # them. Different roles for the same brand+size (a jar AND a master case) are
-    # complementary, both consumed, so role is part of the key and they do NOT split.
-    key_components = {}
-    for _, line in bom[bom['allocation'] == 'auto'].iterrows():
-        k = (_canonical_brand_key(line.get('match_brand', '')),
-             _norm_size(line.get('match_size', '')),
-             str(line.get('match_strain', '') or '').strip().lower(),
-             str(line.get('component_role', '') or '').strip().lower())
-        key_components.setdefault(k, set()).add(str(line.get('component_sku', '')).strip())
-    key_share = {k: max(1, len(v)) for k, v in key_components.items()}
-
-    def _line_burn(line):
-        if sales is None:
-            return 0.0, 0, 1
-        bkey = _canonical_brand_key(line.get('match_brand', ''))
-        if not bkey:
-            return 0.0, 0, 1
-        size = _norm_size(line.get('match_size', ''))
-        strain = str(line.get('match_strain', '') or '').strip().lower()
-        role = str(line.get('component_role', '') or '').strip().lower()
-        share = key_share.get((bkey, size, strain, role), 1)
-        m = sales['_bkey'] == bkey
-        if size:
-            m = m & (sales['_size'] == size)
-        if strain:
-            m = m & sales['_pname'].str.contains(re.escape(strain), na=False)
-        matched = sales[m]
-        qpu = line.get('qty_per_unit')
-        qpu = 0.0 if pd.isna(qpu) else float(qpu)
-        return float(matched['_burn'].sum()) * qpu / share, int(len(matched)), share
-
     target_days = float(target_weeks) * 7.0
     rows = []
     for sku, grp in bom.groupby('component_sku'):
@@ -2194,52 +2312,51 @@ def compute_component_reorder(bom_df: Optional[pd.DataFrame], bl_df: Optional[pd
         on_hand_known = on_hand is not None
         on_hand_val = float(on_hand or 0.0)
 
-        auto_lines = grp[grp['allocation'] == 'auto']
-        has_shared = bool((grp['allocation'] == 'shared_manual').any())
-        daily_burn, matched_skus, max_share = 0.0, 0, 1
-        for _, line in auto_lines.iterrows():
-            b, n, share = _line_burn(line)
-            daily_burn += b
-            matched_skus += n
-            max_share = max(max_share, share)
+        daily_burn = 0.0
+        products, unassigned, qty_missing = [], False, False
+        for _, line in grp.iterrows():
+            pt = str(line.get('product_type') or '').strip()
+            if not pt:
+                unassigned = True
+                continue
+            if str(line.get('component_role') or '').strip().lower() == 'master_case':
+                # Master-case consumption is 1/units_per_case from the product type.
+                u = pt_upc.get(pt)
+                if u is None or pd.isna(u) or u <= 0:
+                    qty_missing = True
+                    continue
+                qty = 1.0 / float(u)
+            else:
+                qty = 1.0   # every other ingredient is one-per-unit
+            daily_burn += pt_burn.get(pt, 0.0) * qty
+            products.append(pt)
 
         has_burn = daily_burn >= MIN_DAILY_SALES
         woh = calculate_woh(on_hand_val, daily_burn) if (on_hand_known and has_burn) else float('nan')
-        if on_hand_known and has_burn:
-            suggested = float(max(0.0, daily_burn * target_days - on_hand_val))
-        else:
-            # No defensible order without BOTH known stock and a real burn signal.
-            suggested = float('nan')
+        suggested = (float(max(0.0, daily_burn * target_days - on_hand_val))
+                     if (on_hand_known and has_burn) else float('nan'))
 
-        if not on_hand_known:
+        if unassigned and not products:
+            flag = 'unassigned'                  # component not tied to any product type
+        elif qty_missing and not has_burn:
+            flag = 'set-units'                   # master case awaiting units_per_case
+        elif not on_hand_known:
             flag = 'no-onhand'
         elif has_burn:
             flag = ('critical' if woh <= WOH_CRITICAL else
                     'urgent' if woh <= WOH_URGENT else
                     'warning' if woh <= WOH_WARNING else 'ok')
-        elif auto_lines.empty and has_shared:
-            flag = 'manual'
         else:
             flag = 'no-sales'
-
-        if auto_lines.empty and has_shared:
-            allocation = 'shared/manual'
-        elif not auto_lines.empty and has_shared:
-            allocation = 'mixed'
-        elif max_share > 1:
-            allocation = f'auto (1/{max_share})'
-        else:
-            allocation = 'auto'
 
         rows.append({
             'Component': name,
             'SKU': str(sku),
-            'Allocation': allocation,
+            'Products': len(set(products)),
             'On Hand': on_hand_val if on_hand_known else float('nan'),
             'Daily Burn': round(daily_burn, 2),
             'WOH': woh,
             'Suggested Order': round(suggested) if pd.notna(suggested) else float('nan'),
-            'Matched SKUs': matched_skus,
             'Flag': flag,
         })
     return pd.DataFrame(rows)
@@ -2252,9 +2369,10 @@ def render_reorder_tab(bl_df: Optional[pd.DataFrame], combined_df: Optional[pd.D
     st.header("🔄 Packaging Reorder")
 
     bom_df = load_bom_map()
+    pt_df = load_product_types()
     if bom_df is None or bom_df.empty:
-        st.info("No BOM map yet. Build and Save the bill-of-materials in the 🧼 Hygiene tab first; "
-                "the reorder view is computed from it.")
+        st.info("No BOM map yet. Build and Save the product types + bill-of-materials in the 🧼 Hygiene tab "
+                "first; the reorder view is computed from them.")
         return
     if bl_df is None or bl_df.empty:
         st.warning("On-hand is unknown until you upload the Beyond Legends Distru CSV in the sidebar. "
@@ -2266,7 +2384,7 @@ def render_reorder_tab(bl_df: Optional[pd.DataFrame], combined_df: Optional[pd.D
         key="reorder_target_weeks",
     )
 
-    result = compute_component_reorder(bom_df, bl_df, combined_df, target_weeks)
+    result = compute_component_reorder(bom_df, pt_df, bl_df, combined_df, target_weeks)
     if result.empty:
         st.info("No mapped components to compute. Add BOM lines in the Hygiene tab.")
         return
@@ -2283,15 +2401,16 @@ def render_reorder_tab(bl_df: Optional[pd.DataFrame], combined_df: Optional[pd.D
     st.markdown("---")
 
     disp = result.sort_values('WOH', ascending=True, na_position='last').copy()
-    display_cols = ['Component', 'SKU', 'Allocation', 'On Hand', 'Daily Burn', 'WOH',
-                    'Suggested Order', 'Matched SKUs', 'Flag']
+    display_cols = ['Component', 'SKU', 'Products', 'On Hand', 'Daily Burn', 'WOH',
+                    'Suggested Order', 'Flag']
     st.dataframe(style_flag_dataframe(disp[display_cols], 'Flag'),
                  use_container_width=True, hide_index=True, height=600)
     st.caption(
         f"Flags: critical (WOH <= {WOH_CRITICAL}), urgent (<= {WOH_URGENT}), warning (<= {WOH_WARNING}), ok. "
-        "manual = shared component, set the split in Hygiene. no-sales = no matching retail sell-through. "
+        "set-units = a master case whose product type has no units_per_case yet (set it in Hygiene). "
+        "unassigned = component not tied to any product type. no-sales = no matching retail sell-through. "
         "no-onhand = not in the Beyond Legends upload (on-hand unknown, so no suggested order). "
-        "'auto (1/N)' = sell-through split across N variant components sharing a match key. "
+        "Products = how many product types consume this component (their burn sums). "
         f"Suggested order (known-stock rows) = daily burn x {int(target_weeks)} weeks minus on-hand."
     )
 
